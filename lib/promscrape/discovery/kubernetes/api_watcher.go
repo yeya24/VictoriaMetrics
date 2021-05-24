@@ -276,18 +276,18 @@ func (gw *groupWatcher) startWatchersForRole(role string, aw *apiWatcher) {
 		if needStart {
 			uw.reloadObjects()
 			go uw.watchForUpdates()
-			if role == "endpoints" || role == "endpointslices" {
-				// Refresh endpoints and enpointslices targets in background, since they depend on other object types such as pod and service.
-				// This should fix https://github.com/VictoriaMetrics/VictoriaMetrics/issues/1240 .
-				go func() {
-					for {
-						time.Sleep(5 * time.Second)
-						gw.mu.Lock()
-						uw.reloadScrapeWorksForAPIWatchersLocked(uw.aws)
-						gw.mu.Unlock()
-					}
-				}()
-			}
+			//if role == "endpoints" || role == "endpointslices" {
+			//	// Refresh endpoints and enpointslices targets in background, since they depend on other object types such as pod and service.
+			//	// This should fix https://github.com/VictoriaMetrics/VictoriaMetrics/issues/1240 .
+			//	go func() {
+			//		for {
+			//			time.Sleep(5 * time.Second)
+			//			gw.mu.Lock()
+			//			uw.reloadScrapeWorksForAPIWatchersLocked(uw.aws)
+			//			gw.mu.Unlock()
+			//		}
+			//	}()
+			//}
 		}
 	}
 }

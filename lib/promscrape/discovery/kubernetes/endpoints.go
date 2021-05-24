@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 
+	"github.com/VictoriaMetrics/VictoriaMetrics/lib/logger"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/promscrape/discoveryutils"
 )
 
@@ -93,7 +94,10 @@ type EndpointPort struct {
 func (eps *Endpoints) getTargetLabels(gw *groupWatcher) []map[string]string {
 	var svc *Service
 	if o := gw.getObjectByRoleLocked("service", eps.Metadata.Namespace, eps.Metadata.Name); o != nil {
+		logger.Infof("service was found for endpoint: %s", eps.Metadata.Name)
 		svc = o.(*Service)
+	} else {
+		logger.Infof("service was not found at cache for endpoint: %s", eps.Metadata.Name)
 	}
 	podPortsSeen := make(map[*Pod][]int)
 	var ms []map[string]string
@@ -142,6 +146,9 @@ func appendEndpointLabelsForAddresses(ms []map[string]string, gw *groupWatcher, 
 		if ea.TargetRef.Name != "" {
 			if o := gw.getObjectByRoleLocked("pod", ea.TargetRef.Namespace, ea.TargetRef.Name); o != nil {
 				p = o.(*Pod)
+				logger.Infof("pod was found for endpoint: %s, pod: %s", eps.Metadata.Name, ea.TargetRef.Name)
+			} else {
+				logger.Infof("pod was not found in cache for endpoint: %s, pod: %s, kind: %s", eps.Metadata.Name, ea.TargetRef.Name, ea.TargetRef.Kind)
 			}
 		}
 		m := getEndpointLabelsForAddressAndPort(podPortsSeen, eps, ea, epp, p, svc, ready)

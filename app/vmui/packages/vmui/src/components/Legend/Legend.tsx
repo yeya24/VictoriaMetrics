@@ -1,10 +1,10 @@
-import React, {FC, useMemo} from "react";
-import {Checkbox, FormControlLabel, Typography} from "@material-ui/core";
-import {MetricCategory} from "../../hooks/useSortedCategories";
+import React, {FC} from "react";
+import {Typography} from "@material-ui/core";
 import {makeStyles} from "@material-ui/core/styles";
 
 export interface LegendItem {
-  seriesName: string;
+  key: string,
+  name: string;
   labelData: {[key: string]: string};
   color: string;
   checked: boolean;
@@ -12,13 +12,13 @@ export interface LegendItem {
 
 export interface LegendProps {
   labels: LegendItem[];
-  categories: MetricCategory[];
-  onChange: (index: number) => void;
+  onClick: (event: React.MouseEvent<HTMLDivElement, MouseEvent>, legendItem: LegendItem) => void;
 }
 
 const useStyles = makeStyles({
   legendWrapper: {
     display: "grid",
+    gridGap: "5px",
     width: "100%",
     gridTemplateColumns: "repeat(auto-fit)", // experiments like repeat(auto-fit, minmax(200px , auto)) may reduce size but readability as well
     gridColumnGap: ".5em",
@@ -26,42 +26,49 @@ const useStyles = makeStyles({
   }
 });
 
-
-export const Legend: FC<LegendProps> = ({labels, onChange, categories}) => {
+export const Legend: FC<LegendProps> = ({labels, onClick}) => {
   const classes = useStyles();
 
-  const commonLabels = useMemo(() => labels.length > 0
-    ? categories
-      .filter(c => c.variations === 1)
-      .map(c => `${c.key}: ${labels[0].labelData[c.key]}`)
-    : [], [categories, labels]);
-
-  const uncommonLabels = useMemo(() => categories.filter(c => c.variations !== 1).map(c => c.key), [categories]);
-
   return <div>
-    <div style={{textAlign: "center"}}>{`Legend for ${commonLabels.join(", ")}`}</div>
     <div className={classes.legendWrapper}>
-      {labels.map((legendItem: LegendItem, index) =>
-        <div key={legendItem.seriesName}>
-          <FormControlLabel
-            control={
-              <Checkbox
-                size="small"
-                checked={legendItem.checked}
-                onChange={() => {
-                  onChange(index);
-                }}
-                style={{
-                  color: legendItem.color,
-                  padding: "4px"
-                }}
-              />
+      {labels.map((legendItem: LegendItem) =>
+        <div key={legendItem.key} style={{
+          display: "flex",
+          alignItems: "center",
+          opacity: legendItem.checked ? 1 : 0.5,
+        }}>
+          <div onClick={(event) => { onClick(event, legendItem); }}
+            style={{display: "flex", alignItems: "center", cursor: "pointer"}}>
+            <div style={{
+              display: "flex",
+              alignItems: "center",
+              justifyContent: "center",
+              width: "14px",
+              height: "14px",
+              marginRight: "4px",
+              border: "1px solid rgba(0, 0, 0, 0.1)",
+              backgroundColor: legendItem.color,
+            }}/>
+            <Typography variant="body2">{legendItem.name}</Typography>
+            <Typography variant="body2" style={{margin: "0 4px 0 8px"}}>{"{"}</Typography>
+            {
+              Object.keys(legendItem.labelData).map((labelKey) => (
+                <Typography variant="body2" key="labelKey" style={{marginRight: "4px"}}>
+                  <b>{labelKey}</b>:{legendItem.labelData[labelKey]}
+                </Typography>
+              ))
             }
-            label={<Typography variant="body2">{uncommonLabels.map(l => `${l}: ${legendItem.labelData[l]}`).join(", ")}</Typography>}
-          />
+            <Typography variant="body2">{"}"}</Typography>
+          </div>
         </div>
       )}
     </div>
-
+    <Typography style={{
+      color: "rgba(0, 0, 0, 0.67)",
+      padding: "9px 0",
+      fontSize: "10px"
+    }}>
+      CTRL + click: toggle multiple series
+    </Typography>
   </div>;
 };

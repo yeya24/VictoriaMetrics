@@ -6,6 +6,7 @@ import (
 	"io"
 
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/logger"
+	"github.com/VictoriaMetrics/VictoriaMetrics/lib/slicesutil"
 )
 
 // partitionSearch represents a search in the partition.
@@ -58,7 +59,7 @@ func (pts *partitionSearch) reset() {
 // tsids must be sorted.
 // tsids cannot be modified after the Init call, since it is owned by pts.
 //
-/// MustClose must be called when partition search is done.
+// MustClose must be called when partition search is done.
 func (pts *partitionSearch) Init(pt *partition, tsids []TSID, tr TimeRange) {
 	if pts.needClosing {
 		logger.Panicf("BUG: missing partitionSearch.MustClose call before the next call to Init")
@@ -80,34 +81,27 @@ func (pts *partitionSearch) Init(pt *partition, tsids []TSID, tr TimeRange) {
 		return
 	}
 
-	pts.pws = pt.GetParts(pts.pws[:0])
+	pts.pws = pt.GetParts(pts.pws[:0], true)
 
 	// Initialize psPool.
-	if n := len(pts.pws) - cap(pts.psPool); n > 0 {
-		pts.psPool = append(pts.psPool[:cap(pts.psPool)], make([]partSearch, n)...)
-	}
-	pts.psPool = pts.psPool[:len(pts.pws)]
+	pts.psPool = slicesutil.SetLength(pts.psPool, len(pts.pws))
 	for i, pw := range pts.pws {
 		pts.psPool[i].Init(pw.p, tsids, tr)
 	}
 
 	// Initialize the psHeap.
-	var errors []error
 	pts.psHeap = pts.psHeap[:0]
 	for i := range pts.psPool {
 		ps := &pts.psPool[i]
 		if !ps.NextBlock() {
 			if err := ps.Error(); err != nil {
-				errors = append(errors, err)
+				// Return only the first error, since it has no sense in returning all errors.
+				pts.err = fmt.Errorf("cannot initialize partition search: %w", err)
+				return
 			}
 			continue
 		}
 		pts.psHeap = append(pts.psHeap, ps)
-	}
-	if len(errors) > 0 {
-		// Return only the first error, since it has no sense in returning all errors.
-		pts.err = fmt.Errorf("cannot initialize partition search: %w", errors[0])
-		return
 	}
 	if len(pts.psHeap) == 0 {
 		pts.err = io.EOF
@@ -196,11 +190,11 @@ func (psh *partSearchHeap) Swap(i, j int) {
 	x[i], x[j] = x[j], x[i]
 }
 
-func (psh *partSearchHeap) Push(x interface{}) {
+func (psh *partSearchHeap) Push(x any) {
 	*psh = append(*psh, x.(*partSearch))
 }
 
-func (psh *partSearchHeap) Pop() interface{} {
+func (psh *partSearchHeap) Pop() any {
 	a := *psh
 	v := a[len(a)-1]
 	*psh = a[:len(a)-1]

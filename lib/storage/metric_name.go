@@ -3,17 +3,15 @@ package storage
 import (
 	"bytes"
 	"fmt"
+	"runtime"
 	"sort"
-	"strconv"
 	"strings"
 	"sync"
-	"sync/atomic"
-	"time"
 
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/bytesutil"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/encoding"
-	"github.com/VictoriaMetrics/VictoriaMetrics/lib/logger"
-	"github.com/VictoriaMetrics/VictoriaMetrics/lib/prompb"
+	"github.com/VictoriaMetrics/VictoriaMetrics/lib/prompbmarshal"
+	"github.com/VictoriaMetrics/VictoriaMetrics/lib/slicesutil"
 )
 
 const (
@@ -65,8 +63,8 @@ func (tag *Tag) copyFrom(src *Tag) {
 	tag.Value = append(tag.Value[:0], src.Value...)
 }
 
-func marshalTagValueNoTrailingTagSeparator(dst, src []byte) []byte {
-	dst = marshalTagValue(dst, src)
+func marshalTagValueNoTrailingTagSeparator(dst []byte, src string) []byte {
+	dst = marshalTagValue(dst, bytesutil.ToUnsafeBytes(src))
 	// Remove trailing tagSeparatorChar
 	return dst[:len(dst)-1]
 }
@@ -162,6 +160,14 @@ var mnPool sync.Pool
 func (mn *MetricName) Reset() {
 	mn.MetricGroup = mn.MetricGroup[:0]
 	mn.Tags = mn.Tags[:0]
+}
+
+// MoveFrom moves src to mn.
+//
+// The src is reset after the call.
+func (mn *MetricName) MoveFrom(src *MetricName) {
+	*mn = *src
+	*src = MetricName{}
 }
 
 // CopyFrom copies src to mn.
@@ -302,8 +308,20 @@ func (mn *MetricName) GetTagValue(tagKey string) []byte {
 }
 
 // SetTags sets tags from src with keys matching addTags.
-func (mn *MetricName) SetTags(addTags []string, src *MetricName) {
+//
+// It adds prefix to copied label names.
+// skipTags contains a list of tags, which must be skipped.
+func (mn *MetricName) SetTags(addTags []string, prefix string, skipTags []string, src *MetricName) {
+	if len(addTags) == 1 && addTags[0] == "*" {
+		// Special case for copying all the tags except of skipTags from src to mn.
+		mn.setAllTags(prefix, skipTags, src)
+		return
+	}
+	bb := bbPool.Get()
 	for _, tagName := range addTags {
+		if containsString(skipTags, tagName) {
+			continue
+		}
 		if tagName == string(metricGroupTagKey) {
 			mn.MetricGroup = append(mn.MetricGroup[:0], src.MetricGroup...)
 			continue
@@ -320,19 +338,47 @@ func (mn *MetricName) SetTags(addTags []string, src *MetricName) {
 			mn.RemoveTag(tagName)
 			continue
 		}
-		found := false
-		for i := range mn.Tags {
-			t := &mn.Tags[i]
-			if string(t.Key) == tagName {
-				t.Value = append(t.Value[:0], srcTag.Value...)
-				found = true
-				break
-			}
-		}
-		if !found {
-			mn.AddTagBytes(srcTag.Key, srcTag.Value)
+		bb.B = append(bb.B[:0], prefix...)
+		bb.B = append(bb.B, tagName...)
+		mn.SetTagBytes(bb.B, srcTag.Value)
+	}
+	bbPool.Put(bb)
+}
+
+var bbPool bytesutil.ByteBufferPool
+
+// SetTagBytes sets tag with the given key to the given value.
+func (mn *MetricName) SetTagBytes(key, value []byte) {
+	for i := range mn.Tags {
+		t := &mn.Tags[i]
+		if string(t.Key) == string(key) {
+			t.Value = append(t.Value[:0], value...)
+			return
 		}
 	}
+	mn.AddTagBytes(key, value)
+}
+
+func (mn *MetricName) setAllTags(prefix string, skipTags []string, src *MetricName) {
+	bb := bbPool.Get()
+	for _, tag := range src.Tags {
+		if containsString(skipTags, bytesutil.ToUnsafeString(tag.Key)) {
+			continue
+		}
+		bb.B = append(bb.B[:0], prefix...)
+		bb.B = append(bb.B, tag.Key...)
+		mn.SetTagBytes(bb.B, tag.Value)
+	}
+	bbPool.Put(bb)
+}
+
+func containsString(a []string, s string) bool {
+	for _, x := range a {
+		if x == s {
+			return true
+		}
+	}
+	return false
 }
 
 func hasTag(tags []string, key []byte) bool {
@@ -370,8 +416,7 @@ func (mn *MetricName) Marshal(dst []byte) []byte {
 		tag := &mn.Tags[i]
 		requiredSize += len(tag.Key) + len(tag.Value) + 2
 	}
-	dst = bytesutil.Resize(dst, requiredSize)
-	dst = dst[:dstLen]
+	dst = bytesutil.ResizeWithCopyMayOverallocate(dst, requiredSize)[:dstLen]
 
 	// Marshal MetricGroup
 	dst = marshalTagValue(dst, mn.MetricGroup)
@@ -383,6 +428,14 @@ func (mn *MetricName) Marshal(dst []byte) []byte {
 		dst = t.Marshal(dst)
 	}
 	return dst
+}
+
+// UnmarshalString unmarshals mn from s
+func (mn *MetricName) UnmarshalString(s string) error {
+	b := bytesutil.ToUnsafeBytes(s)
+	err := mn.Unmarshal(b)
+	runtime.KeepAlive(s)
+	return err
 }
 
 // Unmarshal unmarshals mn from src.
@@ -410,51 +463,15 @@ func (mn *MetricName) Unmarshal(src []byte) error {
 	return nil
 }
 
-// The maximum length of label name.
-//
-// Longer names are truncated.
-const maxLabelNameLen = 256
-
-// The maximum length of label value.
-//
-// Longer values are truncated.
-const maxLabelValueLen = 16 * 1024
-
-// The maximum number of labels per each timeseries.
-var maxLabelsPerTimeseries = 30
-
-// SetMaxLabelsPerTimeseries sets the limit on the number of labels
-// per each time series.
-//
-// Superfluous labels are dropped.
-func SetMaxLabelsPerTimeseries(maxLabels int) {
-	if maxLabels <= 0 {
-		logger.Panicf("BUG: maxLabels must be positive; got %d", maxLabels)
-	}
-	maxLabelsPerTimeseries = maxLabels
-}
-
 // MarshalMetricNameRaw marshals labels to dst and returns the result.
 //
 // The result must be unmarshaled with MetricName.UnmarshalRaw
-func MarshalMetricNameRaw(dst []byte, labels []prompb.Label) []byte {
+func MarshalMetricNameRaw(dst []byte, labels []prompbmarshal.Label) []byte {
 	// Calculate the required space for dst.
 	dstLen := len(dst)
 	dstSize := dstLen
 	for i := range labels {
-		if i >= maxLabelsPerTimeseries {
-			trackDroppedLabels(labels, labels[i:])
-			break
-		}
 		label := &labels[i]
-		if len(label.Name) > maxLabelNameLen {
-			atomic.AddUint64(&TooLongLabelNames, 1)
-			label.Name = label.Name[:maxLabelNameLen]
-		}
-		if len(label.Value) > maxLabelValueLen {
-			atomic.AddUint64(&TooLongLabelValues, 1)
-			label.Value = label.Value[:maxLabelValueLen]
-		}
 		if len(label.Value) == 0 {
 			// Skip labels without values, since they have no sense in prometheus.
 			continue
@@ -466,69 +483,19 @@ func MarshalMetricNameRaw(dst []byte, labels []prompb.Label) []byte {
 		dstSize += len(label.Value)
 		dstSize += 4
 	}
-	dst = bytesutil.Resize(dst, dstSize)[:dstLen]
+	dst = bytesutil.ResizeWithCopyMayOverallocate(dst, dstSize)[:dstLen]
 
 	// Marshal labels to dst.
 	for i := range labels {
-		if i >= maxLabelsPerTimeseries {
-			break
-		}
 		label := &labels[i]
 		if len(label.Value) == 0 {
 			// Skip labels without values, since they have no sense in prometheus.
 			continue
 		}
-		dst = marshalBytesFast(dst, label.Name)
-		dst = marshalBytesFast(dst, label.Value)
+		dst = marshalStringFast(dst, label.Name)
+		dst = marshalStringFast(dst, label.Value)
 	}
 	return dst
-}
-
-var (
-	// MetricsWithDroppedLabels is the number of metrics with at least a single dropped label
-	MetricsWithDroppedLabels uint64
-
-	// TooLongLabelNames is the number of too long label names
-	TooLongLabelNames uint64
-
-	// TooLongLabelValues is the number of too long label values
-	TooLongLabelValues uint64
-)
-
-func trackDroppedLabels(labels, droppedLabels []prompb.Label) {
-	atomic.AddUint64(&MetricsWithDroppedLabels, 1)
-	select {
-	case <-droppedLabelsLogTicker.C:
-		logger.Warnf("dropping %d labels for %s; dropped labels: %s; either reduce the number of labels for this metric "+
-			"or increase -maxLabelsPerTimeseries=%d command-line flag value",
-			len(droppedLabels), labelsToString(labels), labelsToString(droppedLabels), maxLabelsPerTimeseries)
-	default:
-	}
-}
-
-var droppedLabelsLogTicker = time.NewTicker(5 * time.Second)
-
-func labelsToString(labels []prompb.Label) string {
-	labelsCopy := append([]prompb.Label{}, labels...)
-	sort.Slice(labelsCopy, func(i, j int) bool {
-		return string(labelsCopy[i].Name) < string(labelsCopy[j].Name)
-	})
-	var b []byte
-	b = append(b, '{')
-	for i, label := range labelsCopy {
-		if len(label.Name) == 0 {
-			b = append(b, "__name__"...)
-		} else {
-			b = append(b, label.Name...)
-		}
-		b = append(b, '=')
-		b = strconv.AppendQuote(b, string(label.Value))
-		if i < len(labels)-1 {
-			b = append(b, ',')
-		}
-	}
-	b = append(b, '}')
-	return string(b)
 }
 
 // marshalRaw marshals mn to dst and returns the result.
@@ -575,6 +542,12 @@ func (mn *MetricName) UnmarshalRaw(src []byte) error {
 	return nil
 }
 
+func marshalStringFast(dst []byte, s string) []byte {
+	dst = encoding.MarshalUint16(dst, uint16(len(s)))
+	dst = append(dst, s...)
+	return dst
+}
+
 func marshalBytesFast(dst []byte, s []byte) []byte {
 	dst = encoding.MarshalUint16(dst, uint16(len(s)))
 	dst = append(dst, s...)
@@ -595,6 +568,12 @@ func unmarshalBytesFast(src []byte) ([]byte, []byte, error) {
 
 // sortTags sorts tags in mn to canonical form needed for storing in the index.
 //
+// The sortTags tries moving job-like tag to mn.Tags[0], while instance-like tag to mn.Tags[1].
+// See commonTagKeys list for job-like and instance-like tags.
+// This guarantees that indexdb entries for the same (job, instance) are located
+// close to each other on disk. This reduces disk seeks and disk read IO when metrics
+// for a particular job and/or instance are read from the disk.
+//
 // The function also de-duplicates tags with identical keys in mn. The last tag value
 // for duplicate tags wins.
 //
@@ -606,10 +585,8 @@ func (mn *MetricName) sortTags() {
 	}
 
 	cts := getCanonicalTags()
-	if n := len(mn.Tags) - cap(cts.tags); n > 0 {
-		cts.tags = append(cts.tags[:cap(cts.tags)], make([]canonicalTag, n)...)
-	}
-	dst := cts.tags[:len(mn.Tags)]
+	cts.tags = slicesutil.SetLength(cts.tags, len(mn.Tags))
+	dst := cts.tags
 	for i := range mn.Tags {
 		tag := &mn.Tags[i]
 		ct := &dst[i]
@@ -672,6 +649,7 @@ func (ts *canonicalTagsSort) Less(i, j int) bool {
 	x := *ts
 	return string(x[i].key) < string(x[j].key)
 }
+
 func (ts *canonicalTagsSort) Swap(i, j int) {
 	x := *ts
 	x[i], x[j] = x[j], x[i]
@@ -679,10 +657,7 @@ func (ts *canonicalTagsSort) Swap(i, j int) {
 
 func copyTags(dst, src []Tag) []Tag {
 	dstLen := len(dst)
-	if n := dstLen + len(src) - cap(dst); n > 0 {
-		dst = append(dst[:cap(dst)], make([]Tag, n)...)
-	}
-	dst = dst[:dstLen+len(src)]
+	dst = slicesutil.SetLength(dst, dstLen+len(src))
 	for i := range src {
 		dst[dstLen+i].copyFrom(&src[i])
 	}

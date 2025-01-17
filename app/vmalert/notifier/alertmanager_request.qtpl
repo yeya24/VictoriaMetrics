@@ -1,11 +1,14 @@
 {% import (
     "time"
+
+    "github.com/VictoriaMetrics/VictoriaMetrics/lib/prompbmarshal"
 ) %}
 {% stripspace %}
 
-{% func amRequest(alerts []Alert, generatorURL func(Alert) string) %}
+{% func amRequest(alerts []Alert, generatorURL func(Alert) string, lblss [][]prompbmarshal.Label) %}
 [
 {% for i, alert := range alerts %}
+{% code lbls := lblss[i] %}
 {
     "startsAt":{%q= alert.Start.Format(time.RFC3339Nano) %},
     "generatorURL": {%q= generatorURL(alert) %},
@@ -13,9 +16,9 @@
     "endsAt":{%q= alert.End.Format(time.RFC3339Nano) %},
     {% endif %}
     "labels": {
-        "alertname":{%q= alert.Name %}
-        {% for k,v := range alert.Labels %}
-            ,{%q= k %}:{%q= v %}
+        {% code ll := len(lbls) %}
+        {% for idx, l := range lbls %}
+            {%q= l.Name %}:{%q= l.Value %}{% if idx != ll-1 %}, {% endif %}
         {% endfor %}
     },
     "annotations": {

@@ -7,6 +7,7 @@ import (
 	"sort"
 	"strings"
 
+	"github.com/VictoriaMetrics/VictoriaMetrics/lib/blockcache"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/bytesutil"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/encoding"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/logger"
@@ -32,8 +33,6 @@ type partSearch struct {
 
 	metaindex []metaindexRow
 
-	ibCache *indexBlockCache
-
 	bhs []blockHeader
 
 	compressedIndexBuf []byte
@@ -48,7 +47,6 @@ func (ps *partSearch) reset() {
 	ps.tsids = nil
 	ps.tsidIdx = 0
 	ps.metaindex = nil
-	ps.ibCache = nil
 	ps.bhs = nil
 	ps.compressedIndexBuf = ps.compressedIndexBuf[:0]
 	ps.indexBuf = ps.indexBuf[:0]
@@ -71,12 +69,11 @@ func (ps *partSearch) Init(p *part, tsids []TSID, tr TimeRange) {
 		if isInTest && !sort.SliceIsSorted(tsids, func(i, j int) bool { return tsids[i].Less(&tsids[j]) }) {
 			logger.Panicf("BUG: tsids must be sorted; got %+v", tsids)
 		}
-		// take ownership of of tsids.
+		// take ownership of tsids.
 		ps.tsids = tsids
 	}
 	ps.tr = tr
 	ps.metaindex = p.metaindex
-	ps.ibCache = p.ibCache
 
 	// Advance to the first tsid. There is no need in checking
 	// the returned result, since it will be checked in NextBlock.
@@ -123,14 +120,38 @@ func (ps *partSearch) nextTSID() bool {
 	return true
 }
 
+func (ps *partSearch) skipTSIDsSmallerThan(tsid *TSID) bool {
+	if !ps.BlockRef.bh.TSID.Less(tsid) {
+		return true
+	}
+	if !ps.nextTSID() {
+		return false
+	}
+	if !ps.BlockRef.bh.TSID.Less(tsid) {
+		// Fast path: the next TSID isn't smaller than the tsid.
+		return true
+	}
+
+	// Slower path - binary search for the next TSID, which isn't smaller than the tsid.
+	tsids := ps.tsids[ps.tsidIdx:]
+	ps.tsidIdx += sort.Search(len(tsids), func(i int) bool {
+		return !tsids[i].Less(tsid)
+	})
+	if ps.tsidIdx >= len(ps.tsids) {
+		ps.tsidIdx = len(ps.tsids)
+		ps.err = io.EOF
+		return false
+	}
+	ps.BlockRef.bh.TSID = ps.tsids[ps.tsidIdx]
+	ps.tsidIdx++
+	return true
+}
+
 func (ps *partSearch) nextBHS() bool {
 	for len(ps.metaindex) > 0 {
-		// Optimization: skip tsid values smaller than the minimum value
-		// from ps.metaindex.
-		for ps.BlockRef.bh.TSID.Less(&ps.metaindex[0].TSID) {
-			if !ps.nextTSID() {
-				return false
-			}
+		// Optimization: skip tsid values smaller than the minimum value from ps.metaindex.
+		if !ps.skipTSIDsSmallerThan(&ps.metaindex[0].TSID) {
+			return false
 		}
 		// Invariant: ps.BlockRef.bh.TSID >= ps.metaindex[0].TSID
 
@@ -154,19 +175,23 @@ func (ps *partSearch) nextBHS() bool {
 
 		// Found the index block which may contain the required data
 		// for the ps.BlockRef.bh.TSID and the given timestamp range.
-		indexBlockKey := mr.IndexBlockOffset
-		ib := ps.ibCache.Get(indexBlockKey)
-		if ib == nil {
+		indexBlockKey := blockcache.Key{
+			Part:   ps.p,
+			Offset: mr.IndexBlockOffset,
+		}
+		b := ibCache.GetBlock(indexBlockKey)
+		if b == nil {
 			// Slow path - actually read and unpack the index block.
-			var err error
-			ib, err = ps.readIndexBlock(mr)
+			ib, err := ps.readIndexBlock(mr)
 			if err != nil {
 				ps.err = fmt.Errorf("cannot read index block for part %q at offset %d with size %d: %w",
 					&ps.p.ph, mr.IndexBlockOffset, mr.IndexBlockSize, err)
 				return false
 			}
-			ps.ibCache.Put(indexBlockKey, ib)
+			b = ib
+			ibCache.PutBlock(indexBlockKey, b)
 		}
+		ib := b.(*indexBlock)
 		ps.bhs = ib.bhs
 		return true
 	}
@@ -210,7 +235,7 @@ func skipSmallMetaindexRows(metaindex []metaindexRow, tsid *TSID) []metaindexRow
 }
 
 func (ps *partSearch) readIndexBlock(mr *metaindexRow) (*indexBlock, error) {
-	ps.compressedIndexBuf = bytesutil.Resize(ps.compressedIndexBuf[:0], int(mr.IndexBlockSize))
+	ps.compressedIndexBuf = bytesutil.ResizeNoCopyMayOverallocate(ps.compressedIndexBuf, int(mr.IndexBlockSize))
 	ps.p.indexFile.MustReadAt(ps.compressedIndexBuf, int64(mr.IndexBlockOffset))
 
 	var err error
@@ -227,24 +252,31 @@ func (ps *partSearch) readIndexBlock(mr *metaindexRow) (*indexBlock, error) {
 }
 
 func (ps *partSearch) searchBHS() bool {
-	for i := range ps.bhs {
-		bh := &ps.bhs[i]
-
-	nextTSID:
-		if bh.TSID.Less(&ps.BlockRef.bh.TSID) {
-			// Skip blocks with small tsid values.
-			continue
+	bhs := ps.bhs
+	for len(bhs) > 0 {
+		// Skip block headers with tsids smaller than the given tsid.
+		tsid := &ps.BlockRef.bh.TSID
+		if bhs[0].TSID.Less(tsid) {
+			n := sort.Search(len(bhs), func(i int) bool {
+				return !bhs[i].TSID.Less(tsid)
+			})
+			if n == len(bhs) {
+				// Nothing found.
+				break
+			}
+			bhs = bhs[n:]
 		}
+		bh := &bhs[0]
 
-		// Invariant: ps.BlockRef.bh.TSID <= bh.TSID
+		// Invariant: tsid <= bh.TSID
 
-		if bh.TSID.MetricID != ps.BlockRef.bh.TSID.MetricID {
-			// ps.BlockRef.bh.TSID < bh.TSID: no more blocks with the given tsid.
+		if bh.TSID.MetricID != tsid.MetricID {
+			// tsid < bh.TSID: no more blocks with the given tsid.
 			// Proceed to the next (bigger) tsid.
-			if !ps.nextTSID() {
+			if !ps.skipTSIDsSmallerThan(&bh.TSID) {
 				return false
 			}
-			goto nextTSID
+			continue
 		}
 
 		// Found the block with the given tsid. Verify timestamp range.
@@ -253,6 +285,7 @@ func (ps *partSearch) searchBHS() bool {
 		// So use linear search instead of binary search.
 		if bh.MaxTimestamp < ps.tr.MinTimestamp {
 			// Skip the block with too small timestamps.
+			bhs = bhs[1:]
 			continue
 		}
 		if bh.MinTimestamp > ps.tr.MaxTimestamp {
@@ -268,10 +301,9 @@ func (ps *partSearch) searchBHS() bool {
 		// Read it.
 		ps.BlockRef.init(ps.p, bh)
 
-		ps.bhs = ps.bhs[i+1:]
+		ps.bhs = bhs[1:]
 		return true
 	}
-
 	ps.bhs = nil
 	return false
 }

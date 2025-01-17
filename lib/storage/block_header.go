@@ -2,10 +2,12 @@ package storage
 
 import (
 	"fmt"
+	"math"
 	"sort"
 
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/encoding"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/logger"
+	"github.com/VictoriaMetrics/VictoriaMetrics/lib/slicesutil"
 )
 
 // blockHeader is a header for a time series block.
@@ -154,6 +156,79 @@ func (bh *blockHeader) Unmarshal(src []byte) ([]byte, error) {
 	return src, err
 }
 
+func (bh *blockHeader) marshalPortable(dst []byte) []byte {
+	dst = encoding.MarshalVarInt64(dst, bh.MinTimestamp)
+	dst = encoding.MarshalVarInt64(dst, bh.MaxTimestamp)
+	dst = encoding.MarshalVarInt64(dst, bh.FirstValue)
+	dst = encoding.MarshalVarUint64(dst, uint64(bh.RowsCount))
+	dst = encoding.MarshalVarInt64(dst, int64(bh.Scale))
+	dst = append(dst, byte(bh.TimestampsMarshalType), byte(bh.ValuesMarshalType), byte(bh.PrecisionBits))
+	return dst
+}
+
+func (bh *blockHeader) unmarshalPortable(src []byte) ([]byte, error) {
+	minTimestamp, nSize := encoding.UnmarshalVarInt64(src)
+	if nSize <= 0 {
+		return src, fmt.Errorf("cannot unmarshal firstTimestamp from varint")
+	}
+	src = src[nSize:]
+	bh.MinTimestamp = minTimestamp
+
+	maxTimestamp, nSize := encoding.UnmarshalVarInt64(src)
+	if nSize <= 0 {
+		return src, fmt.Errorf("cannot unmarshal firstTimestamp rom varint")
+	}
+	src = src[nSize:]
+	bh.MaxTimestamp = maxTimestamp
+
+	firstValue, nSize := encoding.UnmarshalVarInt64(src)
+	if nSize <= 0 {
+		return src, fmt.Errorf("cannot unmarshal firstValue from varint")
+	}
+	src = src[nSize:]
+	bh.FirstValue = firstValue
+
+	rowsCount, nSize := encoding.UnmarshalVarUint64(src)
+	if nSize <= 0 {
+		return src, fmt.Errorf("cannot unmarshal rowsCount from varuint")
+	}
+	src = src[nSize:]
+	if rowsCount > math.MaxUint32 {
+		return src, fmt.Errorf("got too big rowsCount=%d; it mustn't exceed %d", rowsCount, uint32(math.MaxUint32))
+	}
+	bh.RowsCount = uint32(rowsCount)
+
+	scale, nSize := encoding.UnmarshalVarInt64(src)
+	if nSize <= 0 {
+		return src, fmt.Errorf("cannot unmarshal scale from varint")
+	}
+	src = src[nSize:]
+	if scale < math.MinInt16 {
+		return src, fmt.Errorf("got too small scale=%d; it mustn't be smaller than %d", scale, math.MinInt16)
+	}
+	if scale > math.MaxInt16 {
+		return src, fmt.Errorf("got too big scale=%d; it mustn't exceeed %d", scale, math.MaxInt16)
+	}
+	bh.Scale = int16(scale)
+	if len(src) < 1 {
+		return src, fmt.Errorf("cannot unmarshal marshalType for timestamps from %d bytes; need at least %d bytes", len(src), 1)
+	}
+
+	bh.TimestampsMarshalType = encoding.MarshalType(src[0])
+	src = src[1:]
+	if len(src) < 1 {
+		return src, fmt.Errorf("cannot unmarshal marshalType for values from %d bytes; need at least %d bytes", len(src), 1)
+	}
+	bh.ValuesMarshalType = encoding.MarshalType(src[0])
+	src = src[1:]
+	if len(src) < 1 {
+		return src, fmt.Errorf("cannot unmarshal precisionBits for values from %d bytes; need at least %d bytes", len(src), 1)
+	}
+	bh.PrecisionBits = uint8(src[0])
+	src = src[1:]
+	return src, nil
+}
+
 func (bh *blockHeader) validate() error {
 	if bh.RowsCount == 0 {
 		return fmt.Errorf("RowsCount in block header cannot be zero")
@@ -188,10 +263,7 @@ func unmarshalBlockHeaders(dst []blockHeader, src []byte, blockHeadersCount int)
 		logger.Panicf("BUG: blockHeadersCount must be greater than zero; got %d", blockHeadersCount)
 	}
 	dstLen := len(dst)
-	if n := dstLen + blockHeadersCount - cap(dst); n > 0 {
-		dst = append(dst[:cap(dst)], make([]blockHeader, n)...)
-		dst = dst[:dstLen]
-	}
+	dst = slicesutil.ExtendCapacity(dst, blockHeadersCount)
 	var bh blockHeader
 	for len(src) > 0 {
 		tmp, err := bh.Unmarshal(src)

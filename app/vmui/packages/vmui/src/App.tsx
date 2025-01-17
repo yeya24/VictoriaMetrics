@@ -1,64 +1,100 @@
-import React, {FC} from "react";
-import {SnackbarProvider} from "./contexts/Snackbar";
-import HomeLayout from "./components/Home/HomeLayout";
-import {StateProvider} from "./state/common/StateContext";
-import {AuthStateProvider} from "./state/auth/AuthStateContext";
-import {GraphStateProvider} from "./state/graph/GraphStateContext";
-import { ThemeProvider, Theme, StyledEngineProvider, createTheme } from "@mui/material/styles";
-
-import CssBaseline from "@mui/material/CssBaseline";
-
-import LocalizationProvider from "@mui/lab/LocalizationProvider";
-// pick a date util library
-import DayjsUtils from "@date-io/dayjs";
-
-
-declare module "@mui/styles/defaultTheme" {
-  // eslint-disable-next-line @typescript-eslint/no-empty-interface
-  interface DefaultTheme extends Theme {}
-}
-
+import React, { FC, useState } from "preact/compat";
+import { HashRouter, Route, Routes } from "react-router-dom";
+import router from "./router";
+import AppContextProvider from "./contexts/AppContextProvider";
+import MainLayout from "./layouts/MainLayout/MainLayout";
+import CustomPanel from "./pages/CustomPanel";
+import DashboardsLayout from "./pages/PredefinedPanels";
+import CardinalityPanel from "./pages/CardinalityPanel";
+import TopQueries from "./pages/TopQueries";
+import ThemeProvider from "./components/Main/ThemeProvider/ThemeProvider";
+import TracePage from "./pages/TracePage";
+import ExploreMetrics from "./pages/ExploreMetrics";
+import PreviewIcons from "./components/Main/Icons/PreviewIcons";
+import WithTemplate from "./pages/WithTemplate";
+import Relabel from "./pages/Relabel";
+import ActiveQueries from "./pages/ActiveQueries";
+import QueryAnalyzer from "./pages/QueryAnalyzer";
+import DownsamplingFilters from "./pages/DownsamplingFilters";
+import RetentionFilters from "./pages/RetentionFilters";
+import RawQueryPage from "./pages/RawQueryPage";
 
 const App: FC = () => {
-
-  const THEME = createTheme({
-    palette: {
-      primary: {
-        main: "#3F51B5"
-      },
-      secondary: {
-        main: "#F50057"
-      }
-    },
-    components: {
-      MuiSwitch: {
-        defaultProps: {
-          color: "secondary"
-        }
-      }
-    },
-    typography: {
-      "fontSize": 10
-    }
-  });
+  const [loadedTheme, setLoadedTheme] = useState(false);
 
   return <>
-    <CssBaseline /> {/* CSS Baseline: kind of normalize.css made by materialUI team - can be scoped */}
-    <LocalizationProvider dateAdapter={DayjsUtils}> {/* Allows datepicker to work with DayJS */}
-      <StyledEngineProvider injectFirst>
-        <ThemeProvider theme={THEME}>  {/* Material UI theme customization */}
-          <StateProvider> {/* Serialized into query string, common app settings */}
-            <AuthStateProvider> {/* Auth related info - optionally persisted to Local Storage */}
-              <GraphStateProvider> {/* Graph settings */}
-                <SnackbarProvider> {/* Display various snackbars */}
-                  <HomeLayout/>
-                </SnackbarProvider>
-              </GraphStateProvider>
-            </AuthStateProvider>
-          </StateProvider>
-        </ThemeProvider>
-      </StyledEngineProvider>
-    </LocalizationProvider>
+    <HashRouter>
+      <AppContextProvider>
+        <>
+          <ThemeProvider onLoaded={setLoadedTheme}/>
+          {loadedTheme && (
+            <Routes>
+              <Route
+                path={"/"}
+                element={<MainLayout/>}
+              >
+                <Route
+                  path={router.home}
+                  element={<CustomPanel/>}
+                />
+                <Route
+                  path={router.rawQuery}
+                  element={<RawQueryPage/>}
+                />
+                <Route
+                  path={router.metrics}
+                  element={<ExploreMetrics/>}
+                />
+                <Route
+                  path={router.cardinality}
+                  element={<CardinalityPanel/>}
+                />
+                <Route
+                  path={router.topQueries}
+                  element={<TopQueries/>}
+                />
+                <Route
+                  path={router.trace}
+                  element={<TracePage/>}
+                />
+                <Route
+                  path={router.queryAnalyzer}
+                  element={<QueryAnalyzer/>}
+                />
+                <Route
+                  path={router.dashboards}
+                  element={<DashboardsLayout/>}
+                />
+                <Route
+                  path={router.withTemplate}
+                  element={<WithTemplate/>}
+                />
+                <Route
+                  path={router.relabel}
+                  element={<Relabel/>}
+                />
+                <Route
+                  path={router.activeQueries}
+                  element={<ActiveQueries/>}
+                />
+                <Route
+                  path={router.icons}
+                  element={<PreviewIcons/>}
+                />
+                <Route
+                  path={router.downsamplingDebug}
+                  element={<DownsamplingFilters/>}
+                />
+                <Route
+                  path={router.retentionDebug}
+                  element={<RetentionFilters/>}
+                />
+              </Route>
+            </Routes>
+          )}
+        </>
+      </AppContextProvider>
+    </HashRouter>
   </>;
 };
 

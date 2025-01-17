@@ -16,13 +16,14 @@ type apiConfig struct {
 	client             *discoveryutils.Client
 	port               int
 	hostNetworkingHost string
+	matchFirstNetwork  bool
 
 	// filtersQueryArg contains escaped `filters` query arg to add to each request to Docker Swarm API.
 	filtersQueryArg string
 }
 
 func getAPIConfig(sdc *SDConfig, baseDir string) (*apiConfig, error) {
-	v, err := configMap.Get(sdc, func() (interface{}, error) { return newAPIConfig(sdc, baseDir) })
+	v, err := configMap.Get(sdc, func() (any, error) { return newAPIConfig(sdc, baseDir) })
 	if err != nil {
 		return nil, err
 	}
@@ -37,7 +38,11 @@ func newAPIConfig(sdc *SDConfig, baseDir string) (*apiConfig, error) {
 	cfg := &apiConfig{
 		port:               sdc.Port,
 		hostNetworkingHost: hostNetworkingHost,
+		matchFirstNetwork:  true,
 		filtersQueryArg:    getFiltersQueryArg(sdc.Filters),
+	}
+	if sdc.MatchFirstNetwork != nil {
+		cfg.matchFirstNetwork = *sdc.MatchFirstNetwork
 	}
 	if cfg.port == 0 {
 		cfg.port = 80
@@ -50,7 +55,7 @@ func newAPIConfig(sdc *SDConfig, baseDir string) (*apiConfig, error) {
 	if err != nil {
 		return nil, fmt.Errorf("cannot parse proxy auth config: %w", err)
 	}
-	client, err := discoveryutils.NewClient(sdc.Host, ac, sdc.ProxyURL, proxyAC)
+	client, err := discoveryutils.NewClient(sdc.Host, ac, sdc.ProxyURL, proxyAC, &sdc.HTTPClientConfig)
 	if err != nil {
 		return nil, fmt.Errorf("cannot create HTTP client for %q: %w", sdc.Host, err)
 	}

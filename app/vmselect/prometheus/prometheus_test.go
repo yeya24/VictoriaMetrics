@@ -2,11 +2,12 @@ package prometheus
 
 import (
 	"math"
+	"net/http"
 	"reflect"
+	"runtime"
 	"testing"
 
 	"github.com/VictoriaMetrics/VictoriaMetrics/app/vmselect/netstorage"
-	"github.com/VictoriaMetrics/VictoriaMetrics/lib/storage"
 )
 
 func TestRemoveEmptyValuesAndTimeseries(t *testing.T) {
@@ -197,37 +198,61 @@ func TestAdjustLastPoints(t *testing.T) {
 	})
 }
 
-// helper for tests
-func tfFromKV(k, v string) storage.TagFilter {
-	return storage.TagFilter{
-		Key:   []byte(k),
-		Value: []byte(v),
-	}
-}
-
-func Test_addEnforcedFiltersToTagFilterss(t *testing.T) {
-	f := func(t *testing.T, dstTfss [][]storage.TagFilter, enforcedFilters []storage.TagFilter, want [][]storage.TagFilter) {
+func TestGetLatencyOffsetMillisecondsSuccess(t *testing.T) {
+	f := func(url string, expectedOffset int64) {
 		t.Helper()
-		got := addEnforcedFiltersToTagFilterss(dstTfss, enforcedFilters)
-		if !reflect.DeepEqual(got, want) {
-			t.Fatalf("unxpected result for addEnforcedFiltersToTagFilterss, \ngot: %v,\n want: %v", want, got)
+		r, err := http.NewRequest(http.MethodGet, url, nil)
+		if err != nil {
+			t.Fatalf("unexpected error in NewRequest(%q): %s", url, err)
+		}
+		offset, err := getLatencyOffsetMilliseconds(r)
+		if err != nil {
+			t.Fatalf("unexpected error: %s", err)
+		}
+		if offset != expectedOffset {
+			t.Fatalf("unexpected offset got %d; want %d", offset, expectedOffset)
 		}
 	}
-	f(t, [][]storage.TagFilter{{tfFromKV("label", "value")}},
-		nil,
-		[][]storage.TagFilter{{tfFromKV("label", "value")}})
+	f("http://localhost", latencyOffset.Milliseconds())
+	f("http://localhost?latency_offset=1.234s", 1234)
+}
 
-	f(t, nil,
-		[]storage.TagFilter{tfFromKV("ext-label", "ext-value")},
-		[][]storage.TagFilter{{tfFromKV("ext-label", "ext-value")}})
+func TestGetLatencyOffsetMillisecondsFailure(t *testing.T) {
+	f := func(url string) {
+		t.Helper()
+		r, err := http.NewRequest(http.MethodGet, url, nil)
+		if err != nil {
+			t.Fatalf("unexpected error in NewRequest(%q): %s", url, err)
+		}
+		if _, err := getLatencyOffsetMilliseconds(r); err == nil {
+			t.Fatalf("expecting non-nil error")
+		}
+	}
+	f("http://localhost?latency_offset=foobar")
+}
 
-	f(t, [][]storage.TagFilter{
-		{tfFromKV("l1", "v1")},
-		{tfFromKV("l2", "v2")},
-	},
-		[]storage.TagFilter{tfFromKV("ext-l1", "v2")},
-		[][]storage.TagFilter{
-			{tfFromKV("l1", "v1"), tfFromKV("ext-l1", "v2")},
-			{tfFromKV("l2", "v2"), tfFromKV("ext-l1", "v2")},
-		})
+func TestCalculateMaxMetricsLimitByResource(t *testing.T) {
+	f := func(maxConcurrentRequest, remainingMemory, expect int) {
+		t.Helper()
+		maxMetricsLimit := calculateMaxUniqueTimeSeriesForResource(maxConcurrentRequest, remainingMemory)
+		if maxMetricsLimit != expect {
+			t.Fatalf("unexpected max metrics limit: got %d, want %d", maxMetricsLimit, expect)
+		}
+	}
+
+	// Skip when GOARCH=386
+	if runtime.GOARCH != "386" {
+		// 8 CPU & 32 GiB
+		f(16, int(math.Round(32*1024*1024*1024*0.4)), 4294967)
+		// 4 CPU & 32 GiB
+		f(8, int(math.Round(32*1024*1024*1024*0.4)), 8589934)
+	}
+
+	// 2 CPU & 4 GiB
+	f(4, int(math.Round(4*1024*1024*1024*0.4)), 2147483)
+
+	// other edge cases
+	f(0, int(math.Round(4*1024*1024*1024*0.4)), 2e9)
+	f(4, 0, 0)
+
 }

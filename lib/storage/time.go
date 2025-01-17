@@ -5,6 +5,14 @@ import (
 	"time"
 )
 
+func dateToString(date uint64) string {
+	if date == 0 {
+		return "1970-01-01"
+	}
+	t := time.Unix(int64(date*24*3600), 0).UTC()
+	return t.Format("2006-01-02")
+}
+
 // timestampToTime returns time representation of the given timestamp.
 //
 // The returned time is in UTC timezone.
@@ -26,9 +34,15 @@ type TimeRange struct {
 }
 
 func (tr *TimeRange) String() string {
-	minTime := timestampToTime(tr.MinTimestamp)
-	maxTime := timestampToTime(tr.MaxTimestamp)
-	return fmt.Sprintf("[%s - %s]", minTime, maxTime)
+	start := TimestampToHumanReadableFormat(tr.MinTimestamp)
+	end := TimestampToHumanReadableFormat(tr.MaxTimestamp)
+	return fmt.Sprintf("[%s..%s]", start, end)
+}
+
+// TimestampToHumanReadableFormat converts the given timestamp to human-readable format.
+func TimestampToHumanReadableFormat(timestamp int64) string {
+	t := timestampToTime(timestamp).UTC()
+	return t.Format("2006-01-02T15:04:05.999Z")
 }
 
 // timestampToPartitionName returns partition name for the given timestamp.
@@ -37,7 +51,7 @@ func timestampToPartitionName(timestamp int64) string {
 	return t.Format("2006_01")
 }
 
-// fromPartitionName initializes tr from the given parition name.
+// fromPartitionName initializes tr from the given partition name.
 func (tr *TimeRange) fromPartitionName(name string) error {
 	t, err := time.Parse("2006_01", name)
 	if err != nil {

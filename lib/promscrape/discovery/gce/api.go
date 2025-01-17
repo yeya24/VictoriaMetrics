@@ -3,7 +3,7 @@ package gce
 import (
 	"context"
 	"fmt"
-	"io/ioutil"
+	"io"
 	"net/http"
 	"net/url"
 	"strings"
@@ -25,7 +25,7 @@ type apiConfig struct {
 var configMap = discoveryutils.NewConfigMap()
 
 func getAPIConfig(sdc *SDConfig) (*apiConfig, error) {
-	v, err := configMap.Get(sdc, func() (interface{}, error) { return newAPIConfig(sdc) })
+	v, err := configMap.Get(sdc, func() (any, error) { return newAPIConfig(sdc) })
 	if err != nil {
 		return nil, err
 	}
@@ -42,24 +42,29 @@ func newAPIConfig(sdc *SDConfig) (*apiConfig, error) {
 	if len(project) == 0 {
 		proj, err := getCurrentProject()
 		if err != nil {
+			client.CloseIdleConnections()
 			return nil, fmt.Errorf("cannot determine the current project; make sure `vmagent` runs inside GCE; error: %w", err)
 		}
 		project = proj
 		logger.Infof("autodetected the current GCE project: %q", project)
 	}
-	zones := sdc.Zone.zones
+	zones := sdc.Zone.Zones
 	if len(zones) == 0 {
 		// Autodetect the current zone.
 		zone, err := getCurrentZone()
 		if err != nil {
+			client.CloseIdleConnections()
 			return nil, fmt.Errorf("cannot determine the current zone; make sure `vmagent` runs inside GCE; error: %w", err)
 		}
 		zones = append(zones, zone)
 		logger.Infof("autodetected the current GCE zone: %q", zone)
 	} else if len(zones) == 1 && zones[0] == "*" {
 		// Autodetect zones for project.
-		zs, err := getZonesForProject(client, project, sdc.Filter)
+		// Do not pass sdc.Filter when discovering zones, since GCE doesn't support it.
+		// See https://github.com/VictoriaMetrics/VictoriaMetrics/issues/3202
+		zs, err := getZonesForProject(client, project)
 		if err != nil {
+			client.CloseIdleConnections()
 			return nil, fmt.Errorf("cannot obtain zones for project %q: %w", project, err)
 		}
 		zones = zs
@@ -94,7 +99,7 @@ func getAPIResponse(client *http.Client, apiURL, filter, pageToken string) ([]by
 }
 
 func readResponseBody(resp *http.Response, apiURL string) ([]byte, error) {
-	data, err := ioutil.ReadAll(resp.Body)
+	data, err := io.ReadAll(resp.Body)
 	_ = resp.Body.Close()
 	if err != nil {
 		return nil, fmt.Errorf("cannot read response from %q: %w", apiURL, err)
@@ -142,7 +147,7 @@ func getCurrentProject() (string, error) {
 func getGCEMetadata(path string) ([]byte, error) {
 	// See https://cloud.google.com/compute/docs/storing-retrieving-metadata#default
 	metadataURL := "http://metadata.google.internal/computeMetadata/v1/" + path
-	req, err := http.NewRequest("GET", metadataURL, nil)
+	req, err := http.NewRequest(http.MethodGet, metadataURL, nil)
 	if err != nil {
 		return nil, fmt.Errorf("cannot create http request for %q: %w", metadataURL, err)
 	}

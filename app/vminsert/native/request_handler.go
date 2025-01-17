@@ -6,13 +6,11 @@ import (
 
 	"github.com/VictoriaMetrics/VictoriaMetrics/app/vminsert/common"
 	"github.com/VictoriaMetrics/VictoriaMetrics/app/vminsert/relabel"
-	"github.com/VictoriaMetrics/VictoriaMetrics/lib/cgroup"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/logger"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/prompbmarshal"
 	parserCommon "github.com/VictoriaMetrics/VictoriaMetrics/lib/protoparser/common"
-	parser "github.com/VictoriaMetrics/VictoriaMetrics/lib/protoparser/native"
+	"github.com/VictoriaMetrics/VictoriaMetrics/lib/protoparser/native/stream"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/storage"
-	"github.com/VictoriaMetrics/VictoriaMetrics/lib/writeconcurrencylimiter"
 	"github.com/VictoriaMetrics/metrics"
 )
 
@@ -27,14 +25,13 @@ func InsertHandler(req *http.Request) error {
 	if err != nil {
 		return err
 	}
-	return writeconcurrencylimiter.Do(func() error {
-		return parser.ParseStream(req, func(block *parser.Block) error {
-			return insertRows(block, extraLabels)
-		})
+	isGzip := req.Header.Get("Content-Encoding") == "gzip"
+	return stream.Parse(req.Body, isGzip, func(block *stream.Block) error {
+		return insertRows(block, extraLabels)
 	})
 }
 
-func insertRows(block *parser.Block, extraLabels []prompbmarshal.Label) error {
+func insertRows(block *stream.Block, extraLabels []prompbmarshal.Label) error {
 	ctx := getPushCtx()
 	defer putPushCtx(ctx)
 
@@ -58,14 +55,9 @@ func insertRows(block *parser.Block, extraLabels []prompbmarshal.Label) error {
 		label := &extraLabels[j]
 		ic.AddLabel(label.Name, label.Value)
 	}
-	if hasRelabeling {
-		ic.ApplyRelabeling()
-	}
-	if len(ic.Labels) == 0 {
-		// Skip metric without labels.
+	if !ic.TryPrepareLabels(hasRelabeling) {
 		return nil
 	}
-	ic.SortLabelsIfNeeded()
 	ctx.metricNameBuf = storage.MarshalMetricNameRaw(ctx.metricNameBuf[:0], ic.Labels)
 	values := block.Values
 	timestamps := block.Timestamps
@@ -74,7 +66,9 @@ func insertRows(block *parser.Block, extraLabels []prompbmarshal.Label) error {
 	}
 	for j, value := range values {
 		timestamp := timestamps[j]
-		if err := ic.WriteDataPoint(ctx.metricNameBuf, nil, timestamp, value); err != nil {
+		// TODO: @f41gh7 looks like it's better to use WriteDataPointExt
+		// since metricName never changes inside insertRows call
+		if err := ic.WriteDataPoint(ctx.metricNameBuf, ic.Labels, timestamp, value); err != nil {
 			return err
 		}
 	}
@@ -92,25 +86,15 @@ func (ctx *pushCtx) reset() {
 }
 
 func getPushCtx() *pushCtx {
-	select {
-	case ctx := <-pushCtxPoolCh:
-		return ctx
-	default:
-		if v := pushCtxPool.Get(); v != nil {
-			return v.(*pushCtx)
-		}
-		return &pushCtx{}
+	if v := pushCtxPool.Get(); v != nil {
+		return v.(*pushCtx)
 	}
+	return &pushCtx{}
 }
 
 func putPushCtx(ctx *pushCtx) {
 	ctx.reset()
-	select {
-	case pushCtxPoolCh <- ctx:
-	default:
-		pushCtxPool.Put(ctx)
-	}
+	pushCtxPool.Put(ctx)
 }
 
 var pushCtxPool sync.Pool
-var pushCtxPoolCh = make(chan *pushCtx, cgroup.AvailableCPUs())

@@ -4,9 +4,12 @@
 *.pprof
 /bin
 .idea
+.vscode
 *.test
 *.swp
+/vmdocs
 /gocache-for-docker
+/victoria-logs-data
 /victoria-metrics-data
 /vmagent-remotewrite-data
 /vmstorage-data
@@ -19,3 +22,8 @@
 Gemfile.lock
 /_site
 _site
+*.tmp
+/docs/.jekyll-metadata
+coverage.txt
+cspell.json
+*~

@@ -1,3 +1,4 @@
+// eslint-disable-next-line no-undef
 module.exports = {
   "env": {
     "browser": true,
@@ -10,9 +11,7 @@ module.exports = {
   ],
   "parser": "@typescript-eslint/parser",
   "parserOptions": {
-    "ecmaFeatures": {
-      "jsx": true
-    },
+    "ecmaFeatures": { "jsx": true },
     "ecmaVersion": 12,
     "sourceType": "module"
   },
@@ -21,28 +20,16 @@ module.exports = {
     "@typescript-eslint"
   ],
   "rules": {
-    "indent": [
-      "error",
-      2,
-      { "SwitchCase": 1 }
-    ],
-    "linebreak-style": [
-      "error",
-      "unix"
-    ],
-    "quotes": [
-      "error",
-      "double"
-    ],
-    "semi": [
-      "error",
-      "always"
-    ],
-    "react/prop-types": 0,
-    "max-lines": [
-      "error",
-      {"max": 150}
-    ]
+    "@typescript-eslint/no-unused-vars": ["warn", { "varsIgnorePattern": "^_" }],
+    "react/jsx-closing-bracket-location": [1, "line-aligned"],
+    "react/jsx-max-props-per-line":[1, { "maximum": 1 }],
+    "react/jsx-first-prop-new-line": [1, "multiline"],
+    "object-curly-spacing": [2, "always"],
+    "indent": ["error", 2, { "SwitchCase": 1 }],
+    "linebreak-style": ["error", "unix"],
+    "quotes": ["error", "double"],
+    "semi": ["error", "always"],
+    "react/prop-types": 0
   },
   "settings": {
     "react": {
@@ -52,7 +39,10 @@ module.exports = {
     "linkComponents": [
       // Components used as alternatives to <a> for linking, eg. <Link to={ url } />
       "Hyperlink",
-      {"name": "Link", "linkAttribute": "to"}
+      {
+        "name": "Link", "linkAttribute": "to"
+      }
     ]
   }
 };
+

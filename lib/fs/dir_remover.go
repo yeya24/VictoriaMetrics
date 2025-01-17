@@ -10,9 +10,13 @@ import (
 	"github.com/VictoriaMetrics/metrics"
 )
 
-func mustRemoveAll(path string, done func()) {
+// MustRemoveAll removes path with all the contents.
+//
+// It properly fsyncs the parent directory after path removal.
+//
+// It properly handles NFS issue https://github.com/VictoriaMetrics/VictoriaMetrics/issues/61 .
+func MustRemoveAll(path string) {
 	if tryRemoveAll(path) {
-		done()
 		return
 	}
 	select {
@@ -29,7 +33,6 @@ func mustRemoveAll(path string, done func()) {
 		for {
 			time.Sleep(time.Second)
 			if tryRemoveAll(path) {
-				done()
 				return
 			}
 		}
@@ -71,9 +74,12 @@ func isStaleNFSFileHandleError(err error) bool {
 }
 
 func isTemporaryNFSError(err error) bool {
-	// See https://github.com/VictoriaMetrics/VictoriaMetrics/issues/61 for details.
+	// See https://github.com/VictoriaMetrics/VictoriaMetrics/issues/61
+	// and https://github.com/VictoriaMetrics/VictoriaMetrics/issues/6396 for details.
 	errStr := err.Error()
-	return strings.Contains(errStr, "directory not empty") || strings.Contains(errStr, "device or resource busy")
+	return strings.Contains(errStr, "directory not empty") ||
+		strings.Contains(errStr, "device or resource busy") ||
+		strings.Contains(errStr, "file exists")
 }
 
 // MustStopDirRemover must be called in the end of graceful shutdown

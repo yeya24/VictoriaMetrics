@@ -4,10 +4,13 @@ import (
 	"net/url"
 	"os"
 	"testing"
+
+	"github.com/VictoriaMetrics/VictoriaMetrics/app/vmalert/templates"
 )
 
 func TestMain(m *testing.M) {
-	u, _ := url.Parse("https://victoriametrics.com/path")
-	InitTemplateFunc(u)
+	if err := templates.Load([]string{"testdata/templates/*good.tmpl"}, url.URL{}); err != nil {
+		os.Exit(1)
+	}
 	os.Exit(m.Run())
 }

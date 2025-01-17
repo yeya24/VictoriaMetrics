@@ -7,6 +7,7 @@ import (
 
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/logger"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/promscrape/discoveryutils"
+	"github.com/VictoriaMetrics/VictoriaMetrics/lib/promutils"
 )
 
 func (eps *Endpoints) key() string {
@@ -36,7 +37,7 @@ func parseEndpoints(data []byte) (object, error) {
 
 // EndpointsList implements k8s endpoints list.
 //
-// See https://kubernetes.io/docs/reference/generated/kubernetes-api/v1.17/#endpointslist-v1-core
+// See https://kubernetes.io/docs/reference/generated/kubernetes-api/v1.31/#endpointslist-v1-core
 type EndpointsList struct {
 	Metadata ListMeta
 	Items    []*Endpoints
@@ -44,7 +45,7 @@ type EndpointsList struct {
 
 // Endpoints implements k8s endpoints.
 //
-// See https://kubernetes.io/docs/reference/generated/kubernetes-api/v1.17/#endpoints-v1-core
+// See https://kubernetes.io/docs/reference/generated/kubernetes-api/v1.31/#endpoints-v1-core
 type Endpoints struct {
 	Metadata ObjectMeta
 	Subsets  []EndpointSubset
@@ -52,7 +53,7 @@ type Endpoints struct {
 
 // EndpointSubset implements k8s endpoint subset.
 //
-// See https://kubernetes.io/docs/reference/generated/kubernetes-api/v1.17/#endpointsubset-v1-core
+// See https://kubernetes.io/docs/reference/generated/kubernetes-api/v1.31/#endpointsubset-v1-core
 type EndpointSubset struct {
 	Addresses         []EndpointAddress
 	NotReadyAddresses []EndpointAddress
@@ -61,7 +62,7 @@ type EndpointSubset struct {
 
 // EndpointAddress implements k8s endpoint address.
 //
-// See https://kubernetes.io/docs/reference/generated/kubernetes-api/v1.17/#endpointaddress-v1-core
+// See https://kubernetes.io/docs/reference/generated/kubernetes-api/v1.31/#endpointaddress-v1-core
 type EndpointAddress struct {
 	Hostname  string
 	IP        string
@@ -71,7 +72,7 @@ type EndpointAddress struct {
 
 // ObjectReference implements k8s object reference.
 //
-// See https://kubernetes.io/docs/reference/generated/kubernetes-api/v1.17/#objectreference-v1-core
+// See https://kubernetes.io/docs/reference/generated/kubernetes-api/v1.31/#objectreference-v1-core
 type ObjectReference struct {
 	Kind      string
 	Name      string
@@ -80,7 +81,7 @@ type ObjectReference struct {
 
 // EndpointPort implements k8s endpoint port.
 //
-// See https://v1-21.docs.kubernetes.io/docs/reference/generated/kubernetes-api/v1.21/#endpointport-v1-discovery-k8s-io
+// See https://kubernetes.io/docs/reference/generated/kubernetes-api/v1.31/#endpointport-v1-discovery-k8s-io
 type EndpointPort struct {
 	AppProtocol string
 	Name        string
@@ -91,13 +92,13 @@ type EndpointPort struct {
 // getTargetLabels returns labels for each endpoint in eps.
 //
 // See https://prometheus.io/docs/prometheus/latest/configuration/configuration/#endpoints
-func (eps *Endpoints) getTargetLabels(gw *groupWatcher) []map[string]string {
+func (eps *Endpoints) getTargetLabels(gw *groupWatcher) []*promutils.Labels {
 	var svc *Service
 	if o := gw.getObjectByRoleLocked("service", eps.Metadata.Namespace, eps.Metadata.Name); o != nil {
 		svc = o.(*Service)
 	}
 	podPortsSeen := make(map[*Pod][]int)
-	var ms []map[string]string
+	var ms []*promutils.Labels
 	for _, ess := range eps.Subsets {
 		for _, epp := range ess.Ports {
 			ms = appendEndpointLabelsForAddresses(ms, gw, podPortsSeen, eps, ess.Addresses, epp, svc, "true")
@@ -106,7 +107,7 @@ func (eps *Endpoints) getTargetLabels(gw *groupWatcher) []map[string]string {
 	}
 	// See https://kubernetes.io/docs/reference/labels-annotations-taints/#endpoints-kubernetes-io-over-capacity
 	// and https://github.com/kubernetes/kubernetes/pull/99975
-	switch eps.Metadata.Annotations.GetByName("endpoints.kubernetes.io/over-capacity") {
+	switch eps.Metadata.Annotations.Get("endpoints.kubernetes.io/over-capacity") {
 	case "truncated":
 		logger.Warnf(`the number of targets for "role: endpoints" %q exceeds 1000 and has been truncated; please use "role: endpointslice" instead`, eps.Metadata.key())
 	case "warning":
@@ -122,30 +123,46 @@ func (eps *Endpoints) getTargetLabels(gw *groupWatcher) []map[string]string {
 		}
 		return false
 	}
+	appendPodMetadata := func(p *Pod, c *Container, seen []int, isInit bool) {
+		for _, cp := range c.Ports {
+			if portSeen(cp.ContainerPort, seen) {
+				continue
+			}
+			addr := discoveryutils.JoinHostPort(p.Status.PodIP, cp.ContainerPort)
+			m := promutils.GetLabels()
+			m.Add("__address__", addr)
+			p.appendCommonLabels(m, gw)
+			p.appendContainerLabels(m, c, &cp, isInit)
+
+			// Prometheus sets endpoints_name and namespace labels for all endpoints
+			// Even if port is not matching service port.
+			// See https://github.com/VictoriaMetrics/VictoriaMetrics/issues/4154
+			p.appendEndpointLabels(m, eps)
+			if svc != nil {
+				svc.appendCommonLabels(m)
+			}
+			// Remove possible duplicate labels, which can appear after appendCommonLabels() call
+			m.RemoveDuplicates()
+			ms = append(ms, m)
+		}
+	}
 	for p, ports := range podPortsSeen {
 		for _, c := range p.Spec.Containers {
-			for _, cp := range c.Ports {
-				if portSeen(cp.ContainerPort, ports) {
-					continue
-				}
-				addr := discoveryutils.JoinHostPort(p.Status.PodIP, cp.ContainerPort)
-				m := map[string]string{
-					"__address__": addr,
-				}
-				p.appendCommonLabels(m)
-				p.appendContainerLabels(m, c, &cp)
-				if svc != nil {
-					svc.appendCommonLabels(m)
-				}
-				ms = append(ms, m)
+			appendPodMetadata(p, &c, ports, false)
+		}
+		for _, c := range p.Spec.InitContainers {
+			// Defines native sidecar https://kubernetes.io/blog/2023/08/25/native-sidecar-containers/#what-are-sidecar-containers-in-1-28
+			if c.RestartPolicy != "Always" {
+				continue
 			}
+			appendPodMetadata(p, &c, ports, true)
 		}
 	}
 	return ms
 }
 
-func appendEndpointLabelsForAddresses(ms []map[string]string, gw *groupWatcher, podPortsSeen map[*Pod][]int, eps *Endpoints,
-	eas []EndpointAddress, epp EndpointPort, svc *Service, ready string) []map[string]string {
+func appendEndpointLabelsForAddresses(ms []*promutils.Labels, gw *groupWatcher, podPortsSeen map[*Pod][]int, eps *Endpoints,
+	eas []EndpointAddress, epp EndpointPort, svc *Service, ready string) []*promutils.Labels {
 	for _, ea := range eas {
 		var p *Pod
 		if ea.TargetRef.Name != "" {
@@ -153,27 +170,49 @@ func appendEndpointLabelsForAddresses(ms []map[string]string, gw *groupWatcher, 
 				p = o.(*Pod)
 			}
 		}
-		m := getEndpointLabelsForAddressAndPort(podPortsSeen, eps, ea, epp, p, svc, ready)
+		m := getEndpointLabelsForAddressAndPort(gw, podPortsSeen, eps, ea, epp, p, svc, ready)
+		// Remove possible duplicate labels, which can appear inside getEndpointLabelsForAddressAndPort()
+		m.RemoveDuplicates()
 		ms = append(ms, m)
 	}
 	return ms
 }
 
-func getEndpointLabelsForAddressAndPort(podPortsSeen map[*Pod][]int, eps *Endpoints, ea EndpointAddress, epp EndpointPort, p *Pod, svc *Service, ready string) map[string]string {
+func getEndpointLabelsForAddressAndPort(gw *groupWatcher, podPortsSeen map[*Pod][]int, eps *Endpoints, ea EndpointAddress, epp EndpointPort,
+	p *Pod, svc *Service, ready string) *promutils.Labels {
 	m := getEndpointLabels(eps.Metadata, ea, epp, ready)
 	if svc != nil {
 		svc.appendCommonLabels(m)
 	}
+	// See https://github.com/prometheus/prometheus/issues/10284
 	eps.Metadata.registerLabelsAndAnnotations("__meta_kubernetes_endpoints", m)
 	if ea.TargetRef.Kind != "Pod" || p == nil {
 		return m
 	}
-	p.appendCommonLabels(m)
+	p.appendCommonLabels(m, gw)
+	// always add pod targetRef, even if epp port doesn't match container port
+	// See https://github.com/VictoriaMetrics/VictoriaMetrics/issues/2134
+	if _, ok := podPortsSeen[p]; !ok {
+		podPortsSeen[p] = []int{}
+	}
 	for _, c := range p.Spec.Containers {
 		for _, cp := range c.Ports {
 			if cp.ContainerPort == epp.Port {
-				p.appendContainerLabels(m, c, &cp)
 				podPortsSeen[p] = append(podPortsSeen[p], cp.ContainerPort)
+				p.appendContainerLabels(m, &c, &cp, false)
+				break
+			}
+		}
+	}
+	for _, c := range p.Spec.InitContainers {
+		// Defines native sidecar https://kubernetes.io/blog/2023/08/25/native-sidecar-containers/#what-are-sidecar-containers-in-1-28
+		if c.RestartPolicy != "Always" {
+			continue
+		}
+		for _, cp := range c.Ports {
+			if cp.ContainerPort == epp.Port {
+				podPortsSeen[p] = append(podPortsSeen[p], cp.ContainerPort)
+				p.appendContainerLabels(m, &c, &cp, true)
 				break
 			}
 		}
@@ -181,26 +220,24 @@ func getEndpointLabelsForAddressAndPort(podPortsSeen map[*Pod][]int, eps *Endpoi
 	return m
 }
 
-func getEndpointLabels(om ObjectMeta, ea EndpointAddress, epp EndpointPort, ready string) map[string]string {
+func getEndpointLabels(om ObjectMeta, ea EndpointAddress, epp EndpointPort, ready string) *promutils.Labels {
 	addr := discoveryutils.JoinHostPort(ea.IP, epp.Port)
-	m := map[string]string{
-		"__address__":                      addr,
-		"__meta_kubernetes_namespace":      om.Namespace,
-		"__meta_kubernetes_endpoints_name": om.Name,
-
-		"__meta_kubernetes_endpoint_ready":         ready,
-		"__meta_kubernetes_endpoint_port_name":     epp.Name,
-		"__meta_kubernetes_endpoint_port_protocol": epp.Protocol,
-	}
+	m := promutils.GetLabels()
+	m.Add("__address__", addr)
+	m.Add("__meta_kubernetes_namespace", om.Namespace)
+	m.Add("__meta_kubernetes_endpoints_name", om.Name)
+	m.Add("__meta_kubernetes_endpoint_ready", ready)
+	m.Add("__meta_kubernetes_endpoint_port_name", epp.Name)
+	m.Add("__meta_kubernetes_endpoint_port_protocol", epp.Protocol)
 	if ea.TargetRef.Kind != "" {
-		m["__meta_kubernetes_endpoint_address_target_kind"] = ea.TargetRef.Kind
-		m["__meta_kubernetes_endpoint_address_target_name"] = ea.TargetRef.Name
+		m.Add("__meta_kubernetes_endpoint_address_target_kind", ea.TargetRef.Kind)
+		m.Add("__meta_kubernetes_endpoint_address_target_name", ea.TargetRef.Name)
 	}
 	if ea.NodeName != "" {
-		m["__meta_kubernetes_endpoint_node_name"] = ea.NodeName
+		m.Add("__meta_kubernetes_endpoint_node_name", ea.NodeName)
 	}
 	if ea.Hostname != "" {
-		m["__meta_kubernetes_endpoint_hostname"] = ea.Hostname
+		m.Add("__meta_kubernetes_endpoint_hostname", ea.Hostname)
 	}
 	return m
 }

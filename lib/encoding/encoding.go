@@ -42,6 +42,20 @@ const (
 	MarshalTypeNearestDelta = MarshalType(6)
 )
 
+// NeedsValidation returns true if mt may need additional validation for silent data corruption.
+func (mt MarshalType) NeedsValidation() bool {
+	switch mt {
+	case MarshalTypeNearestDelta2,
+		MarshalTypeNearestDelta:
+		return true
+	default:
+		// Other types do not need additional validation,
+		// since they either already contain checksums (e.g. compressed data)
+		// or they are trivial and cannot be validated (e.g. const or delta const)
+		return false
+	}
+}
+
 // CheckMarshalType verifies whether the mt is valid.
 func CheckMarshalType(mt MarshalType) error {
 	if mt < 0 || mt > 6 {
@@ -217,12 +231,12 @@ func unmarshalInt64Array(dst []int64, src []byte, mt MarshalType, firstValue int
 		return dst, nil
 	case MarshalTypeDeltaConst:
 		v := firstValue
-		tail, d, err := UnmarshalVarInt64(src)
-		if err != nil {
+		d, nLen := UnmarshalVarInt64(src)
+		if nLen <= 0 {
 			return nil, fmt.Errorf("cannot unmarshal delta value for delta const: %w", err)
 		}
-		if len(tail) > 0 {
-			return nil, fmt.Errorf("unexpected trailing data after delta const (d=%d): %d bytes", d, len(tail))
+		if nLen < len(src) {
+			return nil, fmt.Errorf("unexpected trailing data after delta const (d=%d): %d bytes", d, len(src)-nLen)
 		}
 		for itemsCount > 0 {
 			dst = append(dst, v)
@@ -240,7 +254,7 @@ var bbPool bytesutil.ByteBufferPool
 // EnsureNonDecreasingSequence makes sure the first item in a is vMin, the last
 // item in a is vMax and all the items in a are non-decreasing.
 //
-// If this isn't the case the a is fixed accordingly.
+// If this isn't the case then a is fixed accordingly.
 func EnsureNonDecreasingSequence(a []int64, vMin, vMax int64) {
 	if vMax < vMin {
 		logger.Panicf("BUG: vMax cannot be smaller than vMin; got %d vs %d", vMax, vMin)

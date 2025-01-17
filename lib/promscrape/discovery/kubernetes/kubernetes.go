@@ -6,13 +6,14 @@ import (
 	"time"
 
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/promauth"
+	"github.com/VictoriaMetrics/VictoriaMetrics/lib/promutils"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/proxy"
 )
 
 // SDCheckInterval defines interval for targets refresh.
 var SDCheckInterval = flag.Duration("promscrape.kubernetesSDCheckInterval", 30*time.Second, "Interval for checking for changes in Kubernetes API server. "+
 	"This works only if kubernetes_sd_configs is configured in '-promscrape.config' file. "+
-	"See https://prometheus.io/docs/prometheus/latest/configuration/configuration/#kubernetes_sd_config for details")
+	"See https://docs.victoriametrics.com/sd_configs/#kubernetes_sd_configs for details")
 
 // SDConfig represents kubernetes-based service discovery config.
 //
@@ -22,11 +23,15 @@ type SDConfig struct {
 
 	// Use role() function for accessing the Role field
 	Role string `yaml:"role"`
+	// The filepath to kube config.
+	// If defined any cluster connection information from HTTPClientConfig is ignored.
+	KubeConfigFile string `yaml:"kubeconfig_file,omitempty"`
 
 	HTTPClientConfig promauth.HTTPClientConfig `yaml:",inline"`
 	ProxyURL         *proxy.URL                `yaml:"proxy_url,omitempty"`
 	Namespaces       Namespaces                `yaml:"namespaces,omitempty"`
 	Selectors        []Selector                `yaml:"selectors,omitempty"`
+	AttachMetadata   *AttachMetadata           `yaml:"attach_metadata,omitempty"`
 
 	cfg      *apiConfig
 	startErr error
@@ -41,9 +46,17 @@ func (sdc *SDConfig) role() string {
 	return sdc.Role
 }
 
+// AttachMetadata represents `attach_metadata` option at `kuberentes_sd_config`.
+//
+// See https://prometheus.io/docs/prometheus/latest/configuration/configuration/#kubernetes_sd_config
+type AttachMetadata struct {
+	Node bool `yaml:"node"`
+}
+
 // Namespaces represents namespaces for SDConfig
 type Namespaces struct {
-	Names []string `yaml:"names"`
+	OwnNamespace bool     `yaml:"own_namespace"`
+	Names        []string `yaml:"names"`
 }
 
 // Selector represents kubernetes selector.
@@ -57,12 +70,12 @@ type Selector struct {
 }
 
 // ScrapeWorkConstructorFunc must construct ScrapeWork object for the given metaLabels.
-type ScrapeWorkConstructorFunc func(metaLabels map[string]string) interface{}
+type ScrapeWorkConstructorFunc func(metaLabels *promutils.Labels) any
 
 // GetScrapeWorkObjects returns ScrapeWork objects for the given sdc.
 //
 // This function must be called after MustStart call.
-func (sdc *SDConfig) GetScrapeWorkObjects() ([]interface{}, error) {
+func (sdc *SDConfig) GetScrapeWorkObjects() ([]any, error) {
 	if sdc.cfg == nil {
 		return nil, sdc.startErr
 	}
@@ -71,7 +84,7 @@ func (sdc *SDConfig) GetScrapeWorkObjects() ([]interface{}, error) {
 
 // MustStart initializes sdc before its usage.
 //
-// swcFunc is used for constructing such objects.
+// swcFunc is used for constructing ScrapeWork objects from the given metadata.
 func (sdc *SDConfig) MustStart(baseDir string, swcFunc ScrapeWorkConstructorFunc) {
 	cfg, err := newAPIConfig(sdc, baseDir, swcFunc)
 	if err != nil {

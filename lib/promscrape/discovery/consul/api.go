@@ -1,9 +1,10 @@
 package consul
 
 import (
+	"context"
 	"flag"
 	"fmt"
-	"io/ioutil"
+	"net/http"
 	"os"
 	"strconv"
 	"strings"
@@ -12,7 +13,6 @@ import (
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/logger"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/promauth"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/promscrape/discoveryutils"
-	"github.com/VictoriaMetrics/fasthttp"
 )
 
 var waitTime = flag.Duration("promscrape.consul.waitTime", 0, "Wait time used by Consul service discovery. Default value is used if not set")
@@ -30,7 +30,7 @@ func (ac *apiConfig) mustStop() {
 var configMap = discoveryutils.NewConfigMap()
 
 func getAPIConfig(sdc *SDConfig, baseDir string) (*apiConfig, error) {
-	v, err := configMap.Get(sdc, func() (interface{}, error) { return newAPIConfig(sdc, baseDir) })
+	v, err := configMap.Get(sdc, func() (any, error) { return newAPIConfig(sdc, baseDir) })
 	if err != nil {
 		return nil, err
 	}
@@ -39,7 +39,7 @@ func getAPIConfig(sdc *SDConfig, baseDir string) (*apiConfig, error) {
 
 func newAPIConfig(sdc *SDConfig, baseDir string) (*apiConfig, error) {
 	hcc := sdc.HTTPClientConfig
-	token, err := getToken(sdc.Token)
+	token, err := GetToken(sdc.Token)
 	if err != nil {
 		return nil, err
 	}
@@ -70,6 +70,9 @@ func newAPIConfig(sdc *SDConfig, baseDir string) (*apiConfig, error) {
 		scheme := sdc.Scheme
 		if scheme == "" {
 			scheme = "http"
+			if hcc.TLSConfig != nil {
+				scheme = "https"
+			}
 		}
 		apiServer = scheme + "://" + apiServer
 	}
@@ -77,7 +80,7 @@ func newAPIConfig(sdc *SDConfig, baseDir string) (*apiConfig, error) {
 	if err != nil {
 		return nil, fmt.Errorf("cannot parse proxy auth config: %w", err)
 	}
-	client, err := discoveryutils.NewClient(apiServer, ac, sdc.ProxyURL, proxyAC)
+	client, err := discoveryutils.NewClient(apiServer, ac, sdc.ProxyURL, proxyAC, &sdc.HTTPClientConfig)
 	if err != nil {
 		return nil, fmt.Errorf("cannot create HTTP client for %q: %w", apiServer, err)
 	}
@@ -87,7 +90,8 @@ func newAPIConfig(sdc *SDConfig, baseDir string) (*apiConfig, error) {
 	}
 	dc, err := getDatacenter(client, sdc.Datacenter)
 	if err != nil {
-		return nil, err
+		client.Stop()
+		return nil, fmt.Errorf("cannot obtain consul datacenter: %w", err)
 	}
 
 	namespace := sdc.Namespace
@@ -104,36 +108,46 @@ func newAPIConfig(sdc *SDConfig, baseDir string) (*apiConfig, error) {
 	return cfg, nil
 }
 
-func getToken(token *promauth.Secret) (string, error) {
+// GetToken returns Consul token.
+func GetToken(token *promauth.Secret) (string, error) {
 	if token != nil {
 		return token.String(), nil
 	}
 	if tokenFile := os.Getenv("CONSUL_HTTP_TOKEN_FILE"); tokenFile != "" {
-		data, err := ioutil.ReadFile(tokenFile)
+		data, err := os.ReadFile(tokenFile)
 		if err != nil {
 			return "", fmt.Errorf("cannot read consul token file %q; probably, `token` arg is missing in `consul_sd_config`? error: %w", tokenFile, err)
 		}
 		return string(data), nil
 	}
 	t := os.Getenv("CONSUL_HTTP_TOKEN")
-	// Allow empty token - it shouls work if authorization is disabled in Consul
+	// Allow empty token - it should work if authorization is disabled in Consul
 	return t, nil
+}
+
+// GetAgentInfo returns information about current consul agent.
+func GetAgentInfo(client *discoveryutils.Client) (*Agent, error) {
+	// See https://www.consul.io/api/agent.html#read-configuration
+	data, err := client.GetAPIResponse("/v1/agent/self")
+	if err != nil {
+		return nil, fmt.Errorf("cannot query consul agent info: %w", err)
+	}
+	a, err := ParseAgent(data)
+	if err != nil {
+		return nil, err
+	}
+	return a, nil
 }
 
 func getDatacenter(client *discoveryutils.Client, dc string) (string, error) {
 	if dc != "" {
 		return dc, nil
 	}
-	// See https://www.consul.io/api/agent.html#read-configuration
-	data, err := client.GetAPIResponse("/v1/agent/self")
-	if err != nil {
-		return "", fmt.Errorf("cannot query consul agent info: %w", err)
-	}
-	a, err := parseAgent(data)
+	agent, err := GetAgentInfo(client)
 	if err != nil {
 		return "", err
 	}
-	return a.Config.Datacenter, nil
+	return agent.Config.Datacenter, nil
 }
 
 // maxWaitTime is duration for consul blocking request.
@@ -142,7 +156,7 @@ func maxWaitTime() time.Duration {
 	// Consul adds random delay up to wait/16, so reduce the timeout in order to keep it below BlockingClientReadTimeout.
 	// See https://www.consul.io/api-docs/features/blocking
 	d -= d / 8
-	// The timeout cannot exceed 10 minuntes. See https://www.consul.io/api-docs/features/blocking
+	// The timeout cannot exceed 10 minutes. See https://www.consul.io/api-docs/features/blocking
 	if d > 10*time.Minute {
 		d = 10 * time.Minute
 	}
@@ -152,19 +166,22 @@ func maxWaitTime() time.Duration {
 	return d
 }
 
-// getBlockingAPIResponse perfoms blocking request to Consul via client and returns response.
+// getBlockingAPIResponse performs blocking request to Consul via client and returns response.
 //
 // See https://www.consul.io/api-docs/features/blocking .
-func getBlockingAPIResponse(client *discoveryutils.Client, path string, index int64) ([]byte, int64, error) {
+func getBlockingAPIResponse(ctx context.Context, client *discoveryutils.Client, path string, index int64) ([]byte, int64, error) {
 	path += "&index=" + strconv.FormatInt(index, 10)
 	path += "&wait=" + fmt.Sprintf("%ds", int(maxWaitTime().Seconds()))
-	getMeta := func(resp *fasthttp.Response) {
-		ind := resp.Header.Peek("X-Consul-Index")
+	getMeta := func(resp *http.Response) {
+		if resp.StatusCode != http.StatusOK {
+			return
+		}
+		ind := resp.Header.Get("X-Consul-Index")
 		if len(ind) == 0 {
 			logger.Errorf("cannot find X-Consul-Index header in response from %q", path)
 			return
 		}
-		newIndex, err := strconv.ParseInt(string(ind), 10, 64)
+		newIndex, err := strconv.ParseInt(ind, 10, 64)
 		if err != nil {
 			logger.Errorf("cannot parse X-Consul-Index header value in response from %q: %s", path, err)
 			return
@@ -180,7 +197,7 @@ func getBlockingAPIResponse(client *discoveryutils.Client, path string, index in
 		}
 		index = newIndex
 	}
-	data, err := client.GetBlockingAPIResponse(path, getMeta)
+	data, err := client.GetBlockingAPIResponseCtx(ctx, path, getMeta)
 	if err != nil {
 		return nil, index, fmt.Errorf("cannot perform blocking Consul API request at %q: %w", path, err)
 	}

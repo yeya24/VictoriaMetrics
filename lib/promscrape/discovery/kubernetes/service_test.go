@@ -4,8 +4,7 @@ import (
 	"bytes"
 	"testing"
 
-	"github.com/VictoriaMetrics/VictoriaMetrics/lib/prompbmarshal"
-	"github.com/VictoriaMetrics/VictoriaMetrics/lib/promscrape/discoveryutils"
+	"github.com/VictoriaMetrics/VictoriaMetrics/lib/promutils"
 )
 
 func TestParseServiceListFailure(t *testing.T) {
@@ -100,13 +99,14 @@ func TestParseServiceListSuccess(t *testing.T) {
 		t.Fatalf("unexpected resource version; got %s; want %s", meta.ResourceVersion, expectedResourceVersion)
 	}
 	sortedLabelss := getSortedLabelss(objectsByKey)
-	expectedLabelss := [][]prompbmarshal.Label{
-		discoveryutils.GetSortedLabels(map[string]string{
+	expectedLabelss := []*promutils.Labels{
+		promutils.NewLabelsFromMap(map[string]string{
 			"__address__":                             "kube-dns.kube-system.svc:53",
 			"__meta_kubernetes_namespace":             "kube-system",
 			"__meta_kubernetes_service_name":          "kube-dns",
 			"__meta_kubernetes_service_type":          "ClusterIP",
 			"__meta_kubernetes_service_port_name":     "dns",
+			"__meta_kubernetes_service_port_number":   "53",
 			"__meta_kubernetes_service_port_protocol": "UDP",
 			"__meta_kubernetes_service_cluster_ip":    "10.96.0.10",
 
@@ -124,12 +124,13 @@ func TestParseServiceListSuccess(t *testing.T) {
 			"__meta_kubernetes_service_annotationpresent_prometheus_io_port":   "true",
 			"__meta_kubernetes_service_annotationpresent_prometheus_io_scrape": "true",
 		}),
-		discoveryutils.GetSortedLabels(map[string]string{
+		promutils.NewLabelsFromMap(map[string]string{
 			"__address__":                             "kube-dns.kube-system.svc:53",
 			"__meta_kubernetes_namespace":             "kube-system",
 			"__meta_kubernetes_service_name":          "kube-dns",
 			"__meta_kubernetes_service_type":          "ClusterIP",
 			"__meta_kubernetes_service_port_name":     "dns-tcp",
+			"__meta_kubernetes_service_port_number":   "53",
 			"__meta_kubernetes_service_port_protocol": "TCP",
 			"__meta_kubernetes_service_cluster_ip":    "10.96.0.10",
 
@@ -147,12 +148,13 @@ func TestParseServiceListSuccess(t *testing.T) {
 			"__meta_kubernetes_service_annotationpresent_prometheus_io_port":   "true",
 			"__meta_kubernetes_service_annotationpresent_prometheus_io_scrape": "true",
 		}),
-		discoveryutils.GetSortedLabels(map[string]string{
+		promutils.NewLabelsFromMap(map[string]string{
 			"__address__":                             "kube-dns.kube-system.svc:9153",
 			"__meta_kubernetes_namespace":             "kube-system",
 			"__meta_kubernetes_service_name":          "kube-dns",
 			"__meta_kubernetes_service_type":          "ClusterIP",
 			"__meta_kubernetes_service_port_name":     "metrics",
+			"__meta_kubernetes_service_port_number":   "9153",
 			"__meta_kubernetes_service_port_protocol": "TCP",
 			"__meta_kubernetes_service_cluster_ip":    "10.96.0.10",
 

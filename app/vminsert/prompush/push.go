@@ -14,14 +14,14 @@ var (
 
 const maxRowsPerBlock = 10000
 
-// Push pushes wr to storage.
+// Push pushes wr for the given at to storage.
 func Push(wr *prompbmarshal.WriteRequest) {
 	ctx := common.GetInsertCtx()
 	defer common.PutInsertCtx(ctx)
 
 	tss := wr.Timeseries
 	for len(tss) > 0 {
-		// Process big tss in smaller blocks in order to reduce maxmimum memory usage
+		// Process big tss in smaller blocks in order to reduce maximum memory usage
 		samplesCount := 0
 		i := 0
 		for i < len(tss) {
@@ -57,12 +57,9 @@ func push(ctx *common.InsertCtx, tss []prompbmarshal.TimeSeries) {
 			label := &ts.Labels[j]
 			ctx.AddLabel(label.Name, label.Value)
 		}
-		ctx.ApplyRelabeling()
-		if len(ctx.Labels) == 0 {
-			// Skip metric without labels.
+		if !ctx.TryPrepareLabels(false) {
 			continue
 		}
-		ctx.SortLabelsIfNeeded()
 		var metricNameRaw []byte
 		var err error
 		for i := range ts.Samples {

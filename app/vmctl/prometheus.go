@@ -5,10 +5,12 @@ import (
 	"log"
 	"sync"
 
+	"github.com/prometheus/prometheus/tsdb"
+	"github.com/prometheus/prometheus/tsdb/chunkenc"
+
+	"github.com/VictoriaMetrics/VictoriaMetrics/app/vmctl/barpool"
 	"github.com/VictoriaMetrics/VictoriaMetrics/app/vmctl/prometheus"
 	"github.com/VictoriaMetrics/VictoriaMetrics/app/vmctl/vm"
-	"github.com/cheggaaa/pb/v3"
-	"github.com/prometheus/prometheus/tsdb"
 )
 
 type prometheusProcessor struct {
@@ -23,9 +25,12 @@ type prometheusProcessor struct {
 	// and defines number of concurrently
 	// running snapshot block readers
 	cc int
+
+	// isVerbose enables verbose output
+	isVerbose bool
 }
 
-func (pp *prometheusProcessor) run(silent bool) error {
+func (pp *prometheusProcessor) run() error {
 	blocks, err := pp.cl.Explore()
 	if err != nil {
 		return fmt.Errorf("explore failed: %s", err)
@@ -34,11 +39,16 @@ func (pp *prometheusProcessor) run(silent bool) error {
 		return fmt.Errorf("found no blocks to import")
 	}
 	question := fmt.Sprintf("Found %d blocks to import. Continue?", len(blocks))
-	if !silent && !prompt(question) {
+	if !prompt(question) {
 		return nil
 	}
 
-	bar := pb.StartNew(len(blocks))
+	bar := barpool.AddWithTemplate(fmt.Sprintf(barTpl, "Processing blocks"), len(blocks))
+	if err := barpool.Start(); err != nil {
+		return err
+	}
+	defer barpool.Stop()
+
 	blockReadersCh := make(chan tsdb.BlockReader)
 	errCh := make(chan error, pp.cc)
 	pp.im.ResetStats()
@@ -57,7 +67,6 @@ func (pp *prometheusProcessor) run(silent bool) error {
 			}
 		}()
 	}
-
 	// any error breaks the import
 	for _, br := range blocks {
 		select {
@@ -66,7 +75,7 @@ func (pp *prometheusProcessor) run(silent bool) error {
 			return fmt.Errorf("prometheus error: %s", promErr)
 		case vmErr := <-pp.im.Errors():
 			close(blockReadersCh)
-			return fmt.Errorf("Import process failed: \n%s", wrapErr(vmErr))
+			return fmt.Errorf("import process failed: %s", wrapErr(vmErr, pp.isVerbose))
 		case blockReadersCh <- br:
 		}
 	}
@@ -75,11 +84,17 @@ func (pp *prometheusProcessor) run(silent bool) error {
 	wg.Wait()
 	// wait for all buffers to flush
 	pp.im.Close()
+	close(errCh)
 	// drain import errors channel
 	for vmErr := range pp.im.Errors() {
-		return fmt.Errorf("Import process failed: \n%s", wrapErr(vmErr))
+		if vmErr.Err != nil {
+			return fmt.Errorf("import process failed: %s", wrapErr(vmErr, pp.isVerbose))
+		}
 	}
-	bar.Finish()
+	for err := range errCh {
+		return fmt.Errorf("import process failed: %s", err)
+	}
+
 	log.Println("Import finished!")
 	log.Print(pp.im.Stats())
 	return nil
@@ -90,6 +105,7 @@ func (pp *prometheusProcessor) do(b tsdb.BlockReader) error {
 	if err != nil {
 		return fmt.Errorf("failed to read block: %s", err)
 	}
+	var it chunkenc.Iterator
 	for ss.Next() {
 		var name string
 		var labels []vm.LabelPair
@@ -111,8 +127,16 @@ func (pp *prometheusProcessor) do(b tsdb.BlockReader) error {
 
 		var timestamps []int64
 		var values []float64
-		it := series.Iterator()
-		for it.Next() {
+		it = series.Iterator(it)
+		for {
+			typ := it.Next()
+			if typ == chunkenc.ValNone {
+				break
+			}
+			if typ != chunkenc.ValFloat {
+				// Skip unsupported values
+				continue
+			}
 			t, v := it.At()
 			timestamps = append(timestamps, t)
 			values = append(values, v)
@@ -120,11 +144,14 @@ func (pp *prometheusProcessor) do(b tsdb.BlockReader) error {
 		if err := it.Err(); err != nil {
 			return err
 		}
-		pp.im.Input() <- &vm.TimeSeries{
+		ts := vm.TimeSeries{
 			Name:       name,
 			LabelPairs: labels,
 			Timestamps: timestamps,
 			Values:     values,
+		}
+		if err := pp.im.Input(&ts); err != nil {
+			return err
 		}
 	}
 	return ss.Err()

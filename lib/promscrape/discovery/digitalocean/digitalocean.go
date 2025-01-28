@@ -10,13 +10,14 @@ import (
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/logger"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/promauth"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/promscrape/discoveryutils"
+	"github.com/VictoriaMetrics/VictoriaMetrics/lib/promutils"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/proxy"
 )
 
 // SDCheckInterval defines interval for targets refresh.
 var SDCheckInterval = flag.Duration("promscrape.digitaloceanSDCheckInterval", time.Minute, "Interval for checking for changes in digital ocean. "+
 	"This works only if digitalocean_sd_configs is configured in '-promscrape.config' file. "+
-	"See https://prometheus.io/docs/prometheus/latest/configuration/configuration/#digitalocean_sd_config for details")
+	"See https://docs.victoriametrics.com/sd_configs/#digitalocean_sd_configs for details")
 
 // SDConfig represents service discovery config for digital ocean.
 //
@@ -30,7 +31,7 @@ type SDConfig struct {
 }
 
 // GetLabels returns Digital Ocean droplet labels according to sdc.
-func (sdc *SDConfig) GetLabels(baseDir string) ([]map[string]string, error) {
+func (sdc *SDConfig) GetLabels(baseDir string) ([]*promutils.Labels, error) {
 	cfg, err := getAPIConfig(sdc, baseDir)
 	if err != nil {
 		return nil, fmt.Errorf("cannot get API config: %w", err)
@@ -39,7 +40,6 @@ func (sdc *SDConfig) GetLabels(baseDir string) ([]map[string]string, error) {
 	if err != nil {
 		return nil, err
 	}
-
 	return addDropletLabels(droplets, cfg.port), nil
 }
 
@@ -49,18 +49,22 @@ type droplet struct {
 	Name   string `json:"name"`
 	Status string `json:"status"`
 
-	Features []string `json:"features"`
-	Image    struct {
-		Name string `json:"name"`
-		Slug string `json:"slug"`
-	} `json:"image"`
-	SizeSlug string   `json:"size_slug"`
-	Networks networks `json:"networks"`
-	Region   struct {
-		Slug string `json:"slug"`
-	} `json:"region"`
-	Tags    []string `json:"tags"`
-	VpcUUID string   `json:"vpc_uuid"`
+	Features []string      `json:"features"`
+	Image    dropletImage  `json:"image"`
+	SizeSlug string        `json:"size_slug"`
+	Networks networks      `json:"networks"`
+	Region   dropletRegion `json:"region"`
+	Tags     []string      `json:"tags"`
+	VpcUUID  string        `json:"vpc_uuid"`
+}
+
+type dropletImage struct {
+	Name string `json:"name"`
+	Slug string `json:"slug"`
+}
+
+type dropletRegion struct {
+	Slug string `json:"slug"`
 }
 
 func (d *droplet) getIPByNet(netVersion, netType string) string {
@@ -71,7 +75,7 @@ func (d *droplet) getIPByNet(netVersion, netType string) string {
 	case "v6":
 		dropletNetworks = d.Networks.V6
 	default:
-		logger.Fatalf("BUG, unexpected network type: %s, want v4 or v6", netVersion)
+		logger.Panicf("BUG: unexpected network type: %s, want v4 or v6", netVersion)
 	}
 	for _, net := range dropletNetworks {
 		if net.Type == netType {
@@ -98,10 +102,12 @@ type listDropletResponse struct {
 }
 
 type links struct {
-	Pages struct {
-		Last string `json:"last,omitempty"`
-		Next string `json:"next,omitempty"`
-	} `json:"pages,omitempty"`
+	Pages linksPages `json:"pages,omitempty"`
+}
+
+type linksPages struct {
+	Last string `json:"last,omitempty"`
+	Next string `json:"next,omitempty"`
 }
 
 func (r *listDropletResponse) nextURLPath() (string, error) {
@@ -110,13 +116,13 @@ func (r *listDropletResponse) nextURLPath() (string, error) {
 	}
 	u, err := url.Parse(r.Links.Pages.Next)
 	if err != nil {
-		return "", fmt.Errorf("cannot parse digital ocean next url: %s, err: %s", r.Links.Pages.Next, err)
+		return "", fmt.Errorf("cannot parse digital ocean next url: %s: %w", r.Links.Pages.Next, err)
 	}
 	return u.RequestURI(), nil
 }
 
-func addDropletLabels(droplets []droplet, defaultPort int) []map[string]string {
-	var ms []map[string]string
+func addDropletLabels(droplets []droplet, defaultPort int) []*promutils.Labels {
+	var ms []*promutils.Labels
 	for _, droplet := range droplets {
 		if len(droplet.Networks.V4) == 0 {
 			continue
@@ -127,27 +133,26 @@ func addDropletLabels(droplets []droplet, defaultPort int) []map[string]string {
 		publicIPv6 := droplet.getIPByNet("v6", "public")
 
 		addr := discoveryutils.JoinHostPort(publicIPv4, defaultPort)
-		m := map[string]string{
-			"__address__":                      addr,
-			"__meta_digitalocean_droplet_id":   fmt.Sprintf("%d", droplet.ID),
-			"__meta_digitalocean_droplet_name": droplet.Name,
-			"__meta_digitalocean_image":        droplet.Image.Slug,
-			"__meta_digitalocean_image_name":   droplet.Image.Name,
-			"__meta_digitalocean_private_ipv4": privateIPv4,
-			"__meta_digitalocean_public_ipv4":  publicIPv4,
-			"__meta_digitalocean_public_ipv6":  publicIPv6,
-			"__meta_digitalocean_region":       droplet.Region.Slug,
-			"__meta_digitalocean_size":         droplet.SizeSlug,
-			"__meta_digitalocean_status":       droplet.Status,
-			"__meta_digitalocean_vpc":          droplet.VpcUUID,
-		}
+		m := promutils.NewLabels(16)
+		m.Add("__address__", addr)
+		m.Add("__meta_digitalocean_droplet_id", fmt.Sprintf("%d", droplet.ID))
+		m.Add("__meta_digitalocean_droplet_name", droplet.Name)
+		m.Add("__meta_digitalocean_image", droplet.Image.Slug)
+		m.Add("__meta_digitalocean_image_name", droplet.Image.Name)
+		m.Add("__meta_digitalocean_private_ipv4", privateIPv4)
+		m.Add("__meta_digitalocean_public_ipv4", publicIPv4)
+		m.Add("__meta_digitalocean_public_ipv6", publicIPv6)
+		m.Add("__meta_digitalocean_region", droplet.Region.Slug)
+		m.Add("__meta_digitalocean_size", droplet.SizeSlug)
+		m.Add("__meta_digitalocean_status", droplet.Status)
+		m.Add("__meta_digitalocean_vpc", droplet.VpcUUID)
 		if len(droplet.Features) > 0 {
 			features := fmt.Sprintf(",%s,", strings.Join(droplet.Features, ","))
-			m["__meta_digitalocean_features"] = features
+			m.Add("__meta_digitalocean_features", features)
 		}
 		if len(droplet.Tags) > 0 {
 			tags := fmt.Sprintf(",%s,", strings.Join(droplet.Tags, ","))
-			m["__meta_digitalocean_tags"] = tags
+			m.Add("__meta_digitalocean_tags", tags)
 		}
 		ms = append(ms, m)
 	}
@@ -156,5 +161,9 @@ func addDropletLabels(droplets []droplet, defaultPort int) []map[string]string {
 
 // MustStop stops further usage for sdc.
 func (sdc *SDConfig) MustStop() {
-	configMap.Delete(sdc)
+	v := configMap.Delete(sdc)
+	if v != nil {
+		cfg := v.(*apiConfig)
+		cfg.client.Stop()
+	}
 }

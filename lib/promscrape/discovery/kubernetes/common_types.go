@@ -1,7 +1,9 @@
 package kubernetes
 
 import (
+	"github.com/VictoriaMetrics/VictoriaMetrics/lib/bytesutil"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/promscrape/discoveryutils"
+	"github.com/VictoriaMetrics/VictoriaMetrics/lib/promutils"
 )
 
 // ObjectMeta represents ObjectMeta from k8s API.
@@ -11,8 +13,8 @@ type ObjectMeta struct {
 	Name            string
 	Namespace       string
 	UID             string
-	Labels          discoveryutils.SortedLabels
-	Annotations     discoveryutils.SortedLabels
+	Labels          *promutils.Labels
+	Annotations     *promutils.Labels
 	OwnerReferences []OwnerReference
 }
 
@@ -26,17 +28,38 @@ type ListMeta struct {
 	ResourceVersion string
 }
 
-func (om *ObjectMeta) registerLabelsAndAnnotations(prefix string, m map[string]string) {
-	for _, lb := range om.Labels {
-		ln := discoveryutils.SanitizeLabelName(lb.Name)
-		m[prefix+"_label_"+ln] = lb.Value
-		m[prefix+"_labelpresent_"+ln] = "true"
+func (om *ObjectMeta) registerLabelsAndAnnotations(prefix string, m *promutils.Labels) {
+	bb := bbPool.Get()
+	b := bb.B
+	for _, lb := range om.Labels.GetLabels() {
+		b = appendThreeStrings(b[:0], prefix, "_label_", lb.Name)
+		labelName := bytesutil.ToUnsafeString(b)
+		m.Add(discoveryutils.SanitizeLabelName(labelName), lb.Value)
+
+		b = appendThreeStrings(b[:0], prefix, "_labelpresent_", lb.Name)
+		labelName = bytesutil.ToUnsafeString(b)
+		m.Add(discoveryutils.SanitizeLabelName(labelName), "true")
 	}
-	for _, a := range om.Annotations {
-		an := discoveryutils.SanitizeLabelName(a.Name)
-		m[prefix+"_annotation_"+an] = a.Value
-		m[prefix+"_annotationpresent_"+an] = "true"
+	for _, a := range om.Annotations.GetLabels() {
+		b = appendThreeStrings(b[:0], prefix, "_annotation_", a.Name)
+		labelName := bytesutil.ToUnsafeString(b)
+		m.Add(discoveryutils.SanitizeLabelName(labelName), a.Value)
+
+		b = appendThreeStrings(b[:0], prefix, "_annotationpresent_", a.Name)
+		labelName = bytesutil.ToUnsafeString(b)
+		m.Add(discoveryutils.SanitizeLabelName(labelName), "true")
 	}
+	bb.B = b
+	bbPool.Put(bb)
+}
+
+var bbPool bytesutil.ByteBufferPool
+
+func appendThreeStrings(dst []byte, a, b, c string) []byte {
+	dst = append(dst, a...)
+	dst = append(dst, b...)
+	dst = append(dst, c...)
+	return dst
 }
 
 // OwnerReference represents OwnerReferense from k8s API.

@@ -5,6 +5,7 @@ import (
 	"io"
 	"sort"
 
+	"github.com/VictoriaMetrics/VictoriaMetrics/lib/blockcache"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/bytesutil"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/encoding"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/logger"
@@ -25,9 +26,6 @@ type partSearch struct {
 	// The remaining block headers to scan in the current metaindexRow.
 	bhs []blockHeader
 
-	idxbCache *indexBlockCache
-	ibCache   *inmemoryBlockCache
-
 	// err contains the last error.
 	err error
 
@@ -38,6 +36,8 @@ type partSearch struct {
 
 	ib        *inmemoryBlock
 	ibItemIdx int
+
+	sparse bool
 }
 
 func (ps *partSearch) reset() {
@@ -45,8 +45,6 @@ func (ps *partSearch) reset() {
 	ps.p = nil
 	ps.mrs = nil
 	ps.bhs = nil
-	ps.idxbCache = nil
-	ps.ibCache = nil
 	ps.err = nil
 
 	ps.indexBuf = ps.indexBuf[:0]
@@ -56,17 +54,17 @@ func (ps *partSearch) reset() {
 
 	ps.ib = nil
 	ps.ibItemIdx = 0
+	ps.sparse = false
 }
 
 // Init initializes ps for search in the p.
 //
 // Use Seek for search in p.
-func (ps *partSearch) Init(p *part) {
+func (ps *partSearch) Init(p *part, sparse bool) {
 	ps.reset()
 
 	ps.p = p
-	ps.idxbCache = p.idxbCache
-	ps.ibCache = p.ibCache
+	ps.sparse = sparse
 }
 
 // Seek seeks for the first item greater or equal to k in ps.
@@ -144,16 +142,7 @@ func (ps *partSearch) Seek(k []byte) {
 	items := ps.ib.items
 	data := ps.ib.data
 	cpLen := commonPrefixLen(ps.ib.commonPrefix, k)
-	if cpLen > 0 {
-		keySuffix := k[cpLen:]
-		ps.ibItemIdx = sort.Search(len(items), func(i int) bool {
-			it := items[i]
-			it.Start += uint32(cpLen)
-			return string(keySuffix) <= it.String(data)
-		})
-	} else {
-		ps.ibItemIdx = binarySearchKey(data, items, k)
-	}
+	ps.ibItemIdx = binarySearchKey(data, items, k, cpLen)
 	if ps.ibItemIdx < len(items) {
 		// The item has been found.
 		return
@@ -171,14 +160,18 @@ func (ps *partSearch) tryFastSeek(k []byte) bool {
 	if ps.ib == nil {
 		return false
 	}
-	data := ps.ib.data
 	items := ps.ib.items
 	idx := ps.ibItemIdx
 	if idx >= len(items) {
 		// The ib is exhausted.
 		return false
 	}
-	if string(k) > items[len(items)-1].String(data) {
+	cpLen := commonPrefixLen(ps.ib.commonPrefix, k)
+	suffix := k[cpLen:]
+	it := items[len(items)-1]
+	it.Start += uint32(cpLen)
+	data := ps.ib.data
+	if string(suffix) > it.String(data) {
 		// The item is located in next blocks.
 		return false
 	}
@@ -187,8 +180,16 @@ func (ps *partSearch) tryFastSeek(k []byte) bool {
 	if idx > 0 {
 		idx--
 	}
-	if string(k) < items[idx].String(data) {
-		if string(k) < items[0].String(data) {
+	it = items[idx]
+	it.Start += uint32(cpLen)
+	if string(suffix) < it.String(data) {
+		items = items[:idx]
+		if len(items) == 0 {
+			return false
+		}
+		it = items[0]
+		it.Start += uint32(cpLen)
+		if string(suffix) < it.String(data) {
 			// The item is located in previous blocks.
 			return false
 		}
@@ -196,7 +197,7 @@ func (ps *partSearch) tryFastSeek(k []byte) bool {
 	}
 
 	// The item is located in the current block
-	ps.ibItemIdx = idx + binarySearchKey(data, items[idx:], k)
+	ps.ibItemIdx = idx + binarySearchKey(data, items[idx:], k, cpLen)
 	return true
 }
 
@@ -219,6 +220,9 @@ func (ps *partSearch) NextItem() bool {
 
 	// The current block is over. Proceed to the next block.
 	if err := ps.nextBlock(); err != nil {
+		if err != io.EOF {
+			err = fmt.Errorf("error in %q: %w", ps.p.path, err)
+		}
 		ps.err = err
 		return false
 	}
@@ -261,22 +265,26 @@ func (ps *partSearch) nextBHS() error {
 	}
 	mr := &ps.mrs[0]
 	ps.mrs = ps.mrs[1:]
-	idxbKey := mr.indexBlockOffset
-	idxb := ps.idxbCache.Get(idxbKey)
-	if idxb == nil {
-		var err error
-		idxb, err = ps.readIndexBlock(mr)
+	idxbKey := blockcache.Key{
+		Part:   ps.p,
+		Offset: mr.indexBlockOffset,
+	}
+	b := idxbCache.GetBlock(idxbKey)
+	if b == nil {
+		idxb, err := ps.readIndexBlock(mr)
 		if err != nil {
 			return fmt.Errorf("cannot read index block: %w", err)
 		}
-		ps.idxbCache.Put(idxbKey, idxb)
+		b = idxb
+		idxbCache.PutBlock(idxbKey, b)
 	}
+	idxb := b.(*indexBlock)
 	ps.bhs = idxb.bhs
 	return nil
 }
 
 func (ps *partSearch) readIndexBlock(mr *metaindexRow) (*indexBlock, error) {
-	ps.compressedIndexBuf = bytesutil.Resize(ps.compressedIndexBuf, int(mr.indexBlockSize))
+	ps.compressedIndexBuf = bytesutil.ResizeNoCopyMayOverallocate(ps.compressedIndexBuf, int(mr.indexBlockSize))
 	ps.p.indexFile.MustReadAt(ps.compressedIndexBuf, int64(mr.indexBlockOffset))
 
 	var err error
@@ -284,8 +292,10 @@ func (ps *partSearch) readIndexBlock(mr *metaindexRow) (*indexBlock, error) {
 	if err != nil {
 		return nil, fmt.Errorf("cannot decompress index block: %w", err)
 	}
-	idxb := &indexBlock{}
-	idxb.bhs, err = unmarshalBlockHeaders(idxb.bhs[:0], ps.indexBuf, int(mr.blockHeadersCount))
+	idxb := &indexBlock{
+		buf: append([]byte{}, ps.indexBuf...),
+	}
+	idxb.bhs, err = unmarshalBlockHeadersNoCopy(idxb.bhs[:0], idxb.buf, int(mr.blockHeadersCount))
 	if err != nil {
 		return nil, fmt.Errorf("cannot unmarshal block headers from index block (offset=%d, size=%d): %w", mr.indexBlockOffset, mr.indexBlockSize, err)
 	}
@@ -293,30 +303,37 @@ func (ps *partSearch) readIndexBlock(mr *metaindexRow) (*indexBlock, error) {
 }
 
 func (ps *partSearch) getInmemoryBlock(bh *blockHeader) (*inmemoryBlock, error) {
-	var ibKey inmemoryBlockCacheKey
-	ibKey.Init(bh)
-	ib := ps.ibCache.Get(ibKey)
-	if ib != nil {
-		return ib, nil
+	cache := ibCache
+	if ps.sparse {
+		cache = ibSparseCache
 	}
-	ib, err := ps.readInmemoryBlock(bh)
-	if err != nil {
-		return nil, err
+	ibKey := blockcache.Key{
+		Part:   ps.p,
+		Offset: bh.itemsBlockOffset,
 	}
-	ps.ibCache.Put(ibKey, ib)
+	b := cache.GetBlock(ibKey)
+	if b == nil {
+		ib, err := ps.readInmemoryBlock(bh)
+		if err != nil {
+			return nil, err
+		}
+		b = ib
+		cache.PutBlock(ibKey, b)
+	}
+	ib := b.(*inmemoryBlock)
 	return ib, nil
 }
 
 func (ps *partSearch) readInmemoryBlock(bh *blockHeader) (*inmemoryBlock, error) {
 	ps.sb.Reset()
 
-	ps.sb.itemsData = bytesutil.Resize(ps.sb.itemsData, int(bh.itemsBlockSize))
+	ps.sb.itemsData = bytesutil.ResizeNoCopyMayOverallocate(ps.sb.itemsData, int(bh.itemsBlockSize))
 	ps.p.itemsFile.MustReadAt(ps.sb.itemsData, int64(bh.itemsBlockOffset))
 
-	ps.sb.lensData = bytesutil.Resize(ps.sb.lensData, int(bh.lensBlockSize))
+	ps.sb.lensData = bytesutil.ResizeNoCopyMayOverallocate(ps.sb.lensData, int(bh.lensBlockSize))
 	ps.p.lensFile.MustReadAt(ps.sb.lensData, int64(bh.lensBlockOffset))
 
-	ib := getInmemoryBlock()
+	ib := &inmemoryBlock{}
 	if err := ib.UnmarshalData(&ps.sb, bh.firstItem, bh.commonPrefix, bh.itemsCount, bh.marshalType); err != nil {
 		return nil, fmt.Errorf("cannot unmarshal storage block with %d items: %w", bh.itemsCount, err)
 	}
@@ -324,11 +341,14 @@ func (ps *partSearch) readInmemoryBlock(bh *blockHeader) (*inmemoryBlock, error)
 	return ib, nil
 }
 
-func binarySearchKey(data []byte, items []Item, key []byte) int {
+func binarySearchKey(data []byte, items []Item, k []byte, cpLen int) int {
 	if len(items) == 0 {
 		return 0
 	}
-	if string(key) <= items[0].String(data) {
+	suffix := k[cpLen:]
+	it := items[0]
+	it.Start += uint32(cpLen)
+	if string(suffix) <= it.String(data) {
 		// Fast path - the item is the first.
 		return 0
 	}
@@ -340,7 +360,9 @@ func binarySearchKey(data []byte, items []Item, key []byte) int {
 	i, j := uint(0), n
 	for i < j {
 		h := uint(i+j) >> 1
-		if h >= 0 && h < uint(len(items)) && string(key) > items[h].String(data) {
+		it := items[h]
+		it.Start += uint32(cpLen)
+		if h >= 0 && h < uint(len(items)) && string(suffix) > it.String(data) {
 			i = h + 1
 		} else {
 			j = h

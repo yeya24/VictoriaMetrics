@@ -3,16 +3,18 @@ package main
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"log"
+	"math/rand"
 	"net"
 	"net/http"
 	"os"
 	"path/filepath"
 	"reflect"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -38,11 +40,13 @@ const (
 )
 
 const (
-	testReadHTTPPath          = "http://127.0.0.1" + testHTTPListenAddr
-	testWriteHTTPPath         = "http://127.0.0.1" + testHTTPListenAddr + "/write"
-	testOpenTSDBWriteHTTPPath = "http://127.0.0.1" + testOpenTSDBHTTPListenAddr + "/api/put"
-	testPromWriteHTTPPath     = "http://127.0.0.1" + testHTTPListenAddr + "/api/v1/write"
-	testHealthHTTPPath        = "http://127.0.0.1" + testHTTPListenAddr + "/health"
+	testReadHTTPPath           = "http://127.0.0.1" + testHTTPListenAddr
+	testWriteHTTPPath          = "http://127.0.0.1" + testHTTPListenAddr + "/write"
+	testOpenTSDBWriteHTTPPath  = "http://127.0.0.1" + testOpenTSDBHTTPListenAddr + "/api/put"
+	testPromWriteHTTPPath      = "http://127.0.0.1" + testHTTPListenAddr + "/api/v1/write"
+	testImportCSVWriteHTTPPath = "http://127.0.0.1" + testHTTPListenAddr + "/api/v1/import/csv"
+
+	testHealthHTTPPath = "http://127.0.0.1" + testHTTPListenAddr + "/health"
 )
 
 const (
@@ -55,15 +59,15 @@ var (
 )
 
 type test struct {
-	Name             string     `json:"name"`
-	Data             []string   `json:"data"`
-	InsertQuery      string     `json:"insert_query"`
-	Query            []string   `json:"query"`
-	ResultMetrics    []Metric   `json:"result_metrics"`
-	ResultSeries     Series     `json:"result_series"`
-	ResultQuery      Query      `json:"result_query"`
-	ResultQueryRange QueryRange `json:"result_query_range"`
-	Issue            string     `json:"issue"`
+	Name                     string   `json:"name"`
+	Data                     []string `json:"data"`
+	InsertQuery              string   `json:"insert_query"`
+	Query                    []string `json:"query"`
+	ResultMetrics            []Metric `json:"result_metrics"`
+	ResultSeries             Series   `json:"result_series"`
+	ResultQuery              Query    `json:"result_query"`
+	Issue                    string   `json:"issue"`
+	ExpectedResultLinesCount int      `json:"expected_result_lines_count"`
 }
 
 type Metric struct {
@@ -81,42 +85,90 @@ type Series struct {
 	Status string              `json:"status"`
 	Data   []map[string]string `json:"data"`
 }
+
 type Query struct {
-	Status string    `json:"status"`
-	Data   QueryData `json:"data"`
-}
-type QueryData struct {
-	ResultType string            `json:"resultType"`
-	Result     []QueryDataResult `json:"result"`
-}
-
-type QueryDataResult struct {
-	Metric map[string]string `json:"metric"`
-	Value  []interface{}     `json:"value"`
+	Status string `json:"status"`
+	Data   struct {
+		ResultType string          `json:"resultType"`
+		Result     json.RawMessage `json:"result"`
+	} `json:"data"`
 }
 
-func (r *QueryDataResult) UnmarshalJSON(b []byte) error {
-	type plain QueryDataResult
-	return json.Unmarshal(testutil.PopulateTimeTpl(b, insertionTime), (*plain)(r))
+const rtVector, rtMatrix = "vector", "matrix"
+
+func (q *Query) metrics() ([]Metric, error) {
+	switch q.Data.ResultType {
+	case rtVector:
+		var r QueryInstant
+		if err := json.Unmarshal(q.Data.Result, &r.Result); err != nil {
+			return nil, err
+		}
+		return r.metrics()
+	case rtMatrix:
+		var r QueryRange
+		if err := json.Unmarshal(q.Data.Result, &r.Result); err != nil {
+			return nil, err
+		}
+		return r.metrics()
+	default:
+		return nil, fmt.Errorf("unknown result type %q", q.Data.ResultType)
+	}
+}
+
+type QueryInstant struct {
+	Result []struct {
+		Labels map[string]string `json:"metric"`
+		TV     [2]any            `json:"value"`
+	} `json:"result"`
+}
+
+func (q QueryInstant) metrics() ([]Metric, error) {
+	result := make([]Metric, len(q.Result))
+	for i, res := range q.Result {
+		f, err := strconv.ParseFloat(res.TV[1].(string), 64)
+		if err != nil {
+			return nil, fmt.Errorf("metric %v, unable to parse float64 from %s: %w", res, res.TV[1], err)
+		}
+		var m Metric
+		m.Metric = res.Labels
+		m.Timestamps = append(m.Timestamps, int64(res.TV[0].(float64)))
+		m.Values = append(m.Values, f)
+		result[i] = m
+	}
+	return result, nil
 }
 
 type QueryRange struct {
-	Status string         `json:"status"`
-	Data   QueryRangeData `json:"data"`
-}
-type QueryRangeData struct {
-	ResultType string                 `json:"resultType"`
-	Result     []QueryRangeDataResult `json:"result"`
+	Result []struct {
+		Metric map[string]string `json:"metric"`
+		Values [][]any           `json:"values"`
+	} `json:"result"`
 }
 
-type QueryRangeDataResult struct {
-	Metric map[string]string `json:"metric"`
-	Values [][]interface{}   `json:"values"`
+func (q QueryRange) metrics() ([]Metric, error) {
+	var result []Metric
+	for i, res := range q.Result {
+		var m Metric
+		for _, tv := range res.Values {
+			f, err := strconv.ParseFloat(tv[1].(string), 64)
+			if err != nil {
+				return nil, fmt.Errorf("metric %v, unable to parse float64 from %s: %w", res, tv[1], err)
+			}
+			m.Values = append(m.Values, f)
+			m.Timestamps = append(m.Timestamps, int64(tv[0].(float64)))
+		}
+		if len(m.Values) < 1 || len(m.Timestamps) < 1 {
+			return nil, fmt.Errorf("metric %v contains no values", res)
+		}
+		m.Metric = q.Result[i].Metric
+		result = append(result, m)
+	}
+	return result, nil
 }
 
-func (r *QueryRangeDataResult) UnmarshalJSON(b []byte) error {
-	type plain QueryRangeDataResult
-	return json.Unmarshal(testutil.PopulateTimeTpl(b, insertionTime), (*plain)(r))
+func (q *Query) UnmarshalJSON(b []byte) error {
+	type plain Query
+	return json.Unmarshal(testutil.PopulateTimeTpl(b, insertionTime), (*plain)(q))
 }
 
 func TestMain(m *testing.M) {
@@ -130,16 +182,16 @@ func setUp() {
 	storagePath = filepath.Join(os.TempDir(), testStorageSuffix)
 	processFlags()
 	logger.Init()
-	vmstorage.InitWithoutMetrics(promql.ResetRollupResultCacheIfNeeded)
+	vmstorage.Init(promql.ResetRollupResultCacheIfNeeded)
 	vmselect.Init()
 	vminsert.Init()
-	go httpserver.Serve(*httpListenAddr, requestHandler)
+	go httpserver.Serve(*httpListenAddrs, useProxyProtocol, requestHandler)
 	readyStorageCheckFunc := func() bool {
 		resp, err := http.Get(testHealthHTTPPath)
 		if err != nil {
 			return false
 		}
-		resp.Body.Close()
+		_ = resp.Body.Close()
 		return resp.StatusCode == 200
 	}
 	if err := waitFor(testStorageInitTimeout, readyStorageCheckFunc); err != nil {
@@ -179,7 +231,7 @@ func waitFor(timeout time.Duration, f func() bool) error {
 }
 
 func tearDown() {
-	if err := httpserver.Stop(*httpListenAddr); err != nil {
+	if err := httpserver.Stop(*httpListenAddrs); err != nil {
 		log.Printf("cannot stop the webservice: %s", err)
 	}
 	vminsert.Stop()
@@ -190,31 +242,41 @@ func tearDown() {
 
 func TestWriteRead(t *testing.T) {
 	t.Run("write", testWrite)
-	time.Sleep(1 * time.Second)
-	vmstorage.Stop()
-	// open storage after stop in write
-	vmstorage.InitWithoutMetrics(promql.ResetRollupResultCacheIfNeeded)
+	time.Sleep(500 * time.Millisecond)
+	vmstorage.Storage.DebugFlush()
+	time.Sleep(1500 * time.Millisecond)
 	t.Run("read", testRead)
 }
 
 func testWrite(t *testing.T) {
 	t.Run("prometheus", func(t *testing.T) {
-		for _, test := range readIn("prometheus", t, insertionTime) {
-			s := newSuite(t)
-			r := testutil.WriteRequest{}
-			s.noError(json.Unmarshal([]byte(strings.Join(test.Data, "\n")), &r.Timeseries))
-			data, err := testutil.Compress(r)
-			s.greaterThan(len(r.Timeseries), 0)
-			if err != nil {
-				t.Errorf("error compressing %v %s", r, err)
-				t.Fail()
+		for _, test := range readIn("prometheus", insertionTime) {
+			if test.Data == nil {
+				continue
 			}
+			r := testutil.WriteRequest{}
+			testData := strings.Join(test.Data, "\n")
+			if err := json.Unmarshal([]byte(testData), &r.Timeseries); err != nil {
+				panic(fmt.Errorf("BUG: cannot unmarshal TimeSeries: %s\ntest data\n%s", err, testData))
+			}
+			if n := len(r.Timeseries); n <= 0 {
+				panic(fmt.Errorf("BUG: expecting non-empty Timeseries in test data:\n%s", testData))
+			}
+			data := testutil.Compress(r)
 			httpWrite(t, testPromWriteHTTPPath, test.InsertQuery, bytes.NewBuffer(data))
+		}
+	})
+	t.Run("csv", func(t *testing.T) {
+		for _, test := range readIn("csv", insertionTime) {
+			if test.Data == nil {
+				continue
+			}
+			httpWrite(t, testImportCSVWriteHTTPPath, test.InsertQuery, bytes.NewBuffer([]byte(strings.Join(test.Data, "\n"))))
 		}
 	})
 
 	t.Run("influxdb", func(t *testing.T) {
-		for _, x := range readIn("influxdb", t, insertionTime) {
+		for _, x := range readIn("influxdb", insertionTime) {
 			test := x
 			t.Run(test.Name, func(t *testing.T) {
 				t.Parallel()
@@ -223,7 +285,7 @@ func testWrite(t *testing.T) {
 		}
 	})
 	t.Run("graphite", func(t *testing.T) {
-		for _, x := range readIn("graphite", t, insertionTime) {
+		for _, x := range readIn("graphite", insertionTime) {
 			test := x
 			t.Run(test.Name, func(t *testing.T) {
 				t.Parallel()
@@ -232,7 +294,7 @@ func testWrite(t *testing.T) {
 		}
 	})
 	t.Run("opentsdb", func(t *testing.T) {
-		for _, x := range readIn("opentsdb", t, insertionTime) {
+		for _, x := range readIn("opentsdb", insertionTime) {
 			test := x
 			t.Run(test.Name, func(t *testing.T) {
 				t.Parallel()
@@ -241,7 +303,7 @@ func testWrite(t *testing.T) {
 		}
 	})
 	t.Run("opentsdbhttp", func(t *testing.T) {
-		for _, x := range readIn("opentsdbhttp", t, insertionTime) {
+		for _, x := range readIn("opentsdbhttp", insertionTime) {
 			test := x
 			t.Run(test.Name, func(t *testing.T) {
 				t.Parallel()
@@ -253,18 +315,23 @@ func testWrite(t *testing.T) {
 }
 
 func testRead(t *testing.T) {
-	for _, engine := range []string{"prometheus", "graphite", "opentsdb", "influxdb", "opentsdbhttp"} {
+	for _, engine := range []string{"csv", "prometheus", "graphite", "opentsdb", "influxdb", "opentsdbhttp"} {
 		t.Run(engine, func(t *testing.T) {
-			for _, x := range readIn(engine, t, insertionTime) {
+			for _, x := range readIn(engine, insertionTime) {
 				test := x
 				t.Run(test.Name, func(t *testing.T) {
 					t.Parallel()
 					for _, q := range test.Query {
 						q = testutil.PopulateTimeTplString(q, insertionTime)
 						if test.Issue != "" {
-							test.Issue = "Regression in " + test.Issue
+							test.Issue = "\nRegression in " + test.Issue
 						}
-						switch true {
+						switch {
+						case strings.HasPrefix(q, "/api/v1/export/csv"):
+							data := strings.Split(string(httpReadData(t, testReadHTTPPath, q)), "\n")
+							if len(data) == test.ExpectedResultLinesCount {
+								t.Fatalf("not expected number of csv lines want=%d\ngot=%d test=%s.%s\n\response=%q", len(data), test.ExpectedResultLinesCount, q, test.Issue, strings.Join(data, "\n"))
+							}
 						case strings.HasPrefix(q, "/api/v1/export"):
 							if err := checkMetricsResult(httpReadMetrics(t, testReadHTTPPath, q), test.ResultMetrics); err != nil {
 								t.Fatalf("Export. %s fails with error %s.%s", q, err, test.Issue)
@@ -275,17 +342,19 @@ func testRead(t *testing.T) {
 							if err := checkSeriesResult(s, test.ResultSeries); err != nil {
 								t.Fatalf("Series. %s fails with error %s.%s", q, err, test.Issue)
 							}
-						case strings.HasPrefix(q, "/api/v1/query_range"):
-							queryResult := QueryRange{}
-							httpReadStruct(t, testReadHTTPPath, q, &queryResult)
-							if err := checkQueryRangeResult(queryResult, test.ResultQueryRange); err != nil {
-								t.Fatalf("Query Range. %s fails with error %s.%s", q, err, test.Issue)
-							}
 						case strings.HasPrefix(q, "/api/v1/query"):
 							queryResult := Query{}
 							httpReadStruct(t, testReadHTTPPath, q, &queryResult)
-							if err := checkQueryResult(queryResult, test.ResultQuery); err != nil {
-								t.Fatalf("Query. %s fails with error %s.%s", q, err, test.Issue)
+							gotMetrics, err := queryResult.metrics()
+							if err != nil {
+								t.Fatalf("failed to parse query response: %s", err)
+							}
+							expMetrics, err := test.ResultQuery.metrics()
+							if err != nil {
+								t.Fatalf("failed to parse expected response: %s", err)
+							}
+							if err := checkMetricsResult(gotMetrics, expMetrics); err != nil {
+								t.Fatalf("%q fails with error %s.%s", q, err, test.Issue)
 							}
 						default:
 							t.Fatalf("unsupported read query %s", q)
@@ -297,76 +366,141 @@ func testRead(t *testing.T) {
 	}
 }
 
-func readIn(readFor string, t *testing.T, insertTime time.Time) []test {
-	t.Helper()
-	s := newSuite(t)
+func readIn(readFor string, insertTime time.Time) []test {
+	testDir := filepath.Join(testFixturesDir, readFor)
 	var tt []test
-	s.noError(filepath.Walk(filepath.Join(testFixturesDir, readFor), func(path string, info os.FileInfo, err error) error {
+	err := filepath.Walk(testDir, func(path string, _ os.FileInfo, err error) error {
 		if err != nil {
 			return err
 		}
 		if filepath.Ext(path) != ".json" {
 			return nil
 		}
-		b, err := ioutil.ReadFile(path)
-		s.noError(err)
+		b, err := os.ReadFile(path)
+		if err != nil {
+			panic(fmt.Errorf("BUG: cannot read %s: %s", path, err))
+		}
 		item := test{}
-		s.noError(json.Unmarshal(b, &item))
+		if err := json.Unmarshal(b, &item); err != nil {
+			panic(fmt.Errorf("cannot parse %T from %s: %s; data:\n%s", &item, path, err, b))
+		}
 		for i := range item.Data {
 			item.Data[i] = testutil.PopulateTimeTplString(item.Data[i], insertTime)
 		}
 		tt = append(tt, item)
 		return nil
-	}))
+	})
+	if err != nil {
+		panic(fmt.Errorf("BUG: cannot read test data at %s: %w", testDir, err))
+	}
 	if len(tt) == 0 {
-		t.Fatalf("no test found in %s", filepath.Join(testFixturesDir, readFor))
+		panic(fmt.Errorf("BUG: no tests found in %s", testDir))
 	}
 	return tt
 }
 
 func httpWrite(t *testing.T, address, query string, r io.Reader) {
 	t.Helper()
-	s := newSuite(t)
-	resp, err := http.Post(address+query, "", r)
-	s.noError(err)
-	s.noError(resp.Body.Close())
-	s.equalInt(resp.StatusCode, 204)
+
+	requestURL := address + query
+	resp, err := http.Post(requestURL, "", r)
+	if err != nil {
+		t.Fatalf("cannot send request to %s: %s", requestURL, err)
+	}
+	_ = resp.Body.Close()
+	if resp.StatusCode != 204 {
+		t.Fatalf("unexpected status code received from %s; got %d; want 204", requestURL, resp.StatusCode)
+	}
 }
 
-func tcpWrite(t *testing.T, address string, data string) {
+func tcpWrite(t *testing.T, address, data string) {
 	t.Helper()
-	s := newSuite(t)
+
 	conn, err := net.Dial("tcp", address)
-	s.noError(err)
-	defer conn.Close()
+	if err != nil {
+		t.Fatalf("cannot dial %s: %s", address, err)
+	}
+	defer func() {
+		_ = conn.Close()
+	}()
 	n, err := conn.Write([]byte(data))
-	s.noError(err)
-	s.equalInt(n, len(data))
+	if err != nil {
+		t.Fatalf("cannot write %d bytes to %s: %s", len(data), address, err)
+	}
+	if n != len(data) {
+		panic(fmt.Errorf("BUG: conn.Write() returned unexpected number of written bytes to %s; got %d; want %d", address, n, len(data)))
+	}
 }
 
 func httpReadMetrics(t *testing.T, address, query string) []Metric {
 	t.Helper()
-	s := newSuite(t)
-	resp, err := http.Get(address + query)
-	s.noError(err)
-	defer resp.Body.Close()
-	s.equalInt(resp.StatusCode, 200)
+
+	requestURL := address + query
+	resp, err := http.Get(requestURL)
+	if err != nil {
+		t.Fatalf("cannot send request to %s: %s", requestURL, err)
+	}
+	defer func() {
+		_ = resp.Body.Close()
+	}()
+	if resp.StatusCode != 200 {
+		t.Fatalf("unexpected status code received from %s; got %d; want 200", requestURL, resp.StatusCode)
+	}
+
 	var rows []Metric
-	for dec := json.NewDecoder(resp.Body); dec.More(); {
+	dec := json.NewDecoder(resp.Body)
+	for {
 		var row Metric
-		s.noError(dec.Decode(&row))
+		err := dec.Decode(&row)
+		if err != nil {
+			if errors.Is(err, io.EOF) {
+				return rows
+			}
+			t.Fatalf("cannot decode %T from response received from %s: %s", &row, requestURL, err)
+		}
 		rows = append(rows, row)
 	}
-	return rows
 }
-func httpReadStruct(t *testing.T, address, query string, dst interface{}) {
+
+func httpReadStruct(t *testing.T, address, query string, dst any) {
 	t.Helper()
-	s := newSuite(t)
-	resp, err := http.Get(address + query)
-	s.noError(err)
-	defer resp.Body.Close()
-	s.equalInt(resp.StatusCode, 200)
-	s.noError(json.NewDecoder(resp.Body).Decode(dst))
+
+	requestURL := address + query
+	resp, err := http.Get(requestURL)
+	if err != nil {
+		t.Fatalf("cannot send request to %s: %s", requestURL, err)
+	}
+	defer func() {
+		_ = resp.Body.Close()
+	}()
+	if resp.StatusCode != 200 {
+		t.Fatalf("unexpected status code received from %s; got %d; want 200", requestURL, resp.StatusCode)
+	}
+	err = json.NewDecoder(resp.Body).Decode(dst)
+	if err != nil {
+		t.Fatalf("cannot decode %T from response received from %s: %s", dst, requestURL, err)
+	}
+}
+
+func httpReadData(t *testing.T, address, query string) []byte {
+	t.Helper()
+
+	requestURL := address + query
+	resp, err := http.Get(requestURL)
+	if err != nil {
+		t.Fatalf("cannot send request to %s: %s", requestURL, err)
+	}
+	defer func() {
+		_ = resp.Body.Close()
+	}()
+	if resp.StatusCode != 200 {
+		t.Fatalf("unexpected status code received from %s; got %d; want 200", requestURL, resp.StatusCode)
+	}
+	data, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("cannot read response from %s: %s", requestURL, err)
+	}
+	return data
 }
 
 func checkMetricsResult(got, want []Metric) error {
@@ -414,84 +548,72 @@ func removeIfFoundSeries(r map[string]string, contains []map[string]string) []ma
 	return contains
 }
 
-func checkQueryResult(got, want Query) error {
-	if got.Status != want.Status {
-		return fmt.Errorf("status mismatch %q - %q", want.Status, got.Status)
-	}
-	if got.Data.ResultType != want.Data.ResultType {
-		return fmt.Errorf("result type mismatch %q - %q", want.Data.ResultType, got.Data.ResultType)
-	}
-	wantData := append([]QueryDataResult(nil), want.Data.Result...)
-	for _, r := range got.Data.Result {
-		wantData = removeIfFoundQueryData(r, wantData)
-	}
-	if len(wantData) > 0 {
-		return fmt.Errorf("expected query result %+v not found in %+v", wantData, got.Data.Result)
-	}
-	return nil
-}
+func TestImportJSONLines(t *testing.T) {
+	f := func(labelsCount, labelLen int) {
+		t.Helper()
 
-func removeIfFoundQueryData(r QueryDataResult, contains []QueryDataResult) []QueryDataResult {
-	for i, item := range contains {
-		if reflect.DeepEqual(r.Metric, item.Metric) && reflect.DeepEqual(r.Value[0], item.Value[0]) && reflect.DeepEqual(r.Value[1], item.Value[1]) {
-			contains[i] = contains[len(contains)-1]
-			return contains[:len(contains)-1]
+		reqURL := fmt.Sprintf("http://localhost%s/api/v1/import", testHTTPListenAddr)
+		line := generateJSONLine(labelsCount, labelLen)
+		req, err := http.NewRequest("POST", reqURL, bytes.NewBufferString(line))
+		if err != nil {
+			t.Fatalf("cannot create request: %s", err)
+		}
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatalf("cannot perform request for labelsCount=%d, labelLen=%d: %s", labelsCount, labelLen, err)
+		}
+		if resp.StatusCode != 204 {
+			t.Fatalf("unexpected statusCode for labelsCount=%d, labelLen=%d; got %d; want 204", labelsCount, labelLen, resp.StatusCode)
 		}
 	}
-	return contains
+
+	// labels with various lengths
+	for i := 0; i < 500; i++ {
+		f(10, i*5)
+	}
+
+	// Too many labels
+	f(1000, 100)
+
+	// Too long labels
+	f(1, 100_000)
+	f(10, 100_000)
+	f(10, 10_000)
 }
 
-func checkQueryRangeResult(got, want QueryRange) error {
-	if got.Status != want.Status {
-		return fmt.Errorf("status mismatch %q - %q", want.Status, got.Status)
+func generateJSONLine(labelsCount, labelLen int) string {
+	m := make(map[string]string, labelsCount)
+	m["__name__"] = generateSizedRandomString(labelLen)
+	for j := 1; j < labelsCount; j++ {
+		labelName := generateSizedRandomString(labelLen)
+		labelValue := generateSizedRandomString(labelLen)
+		m[labelName] = labelValue
 	}
-	if got.Data.ResultType != want.Data.ResultType {
-		return fmt.Errorf("result type mismatch %q - %q", want.Data.ResultType, got.Data.ResultType)
-	}
-	wantData := append([]QueryRangeDataResult(nil), want.Data.Result...)
-	for _, r := range got.Data.Result {
-		wantData = removeIfFoundQueryRangeData(r, wantData)
-	}
-	if len(wantData) > 0 {
-		return fmt.Errorf("expected query range result %+v not found in %+v", wantData, got.Data.Result)
-	}
-	return nil
-}
 
-func removeIfFoundQueryRangeData(r QueryRangeDataResult, contains []QueryRangeDataResult) []QueryRangeDataResult {
-	for i, item := range contains {
-		if reflect.DeepEqual(r.Metric, item.Metric) && reflect.DeepEqual(r.Values, item.Values) {
-			contains[i] = contains[len(contains)-1]
-			return contains[:len(contains)-1]
-		}
+	type jsonLine struct {
+		Metric     map[string]string `json:"metric"`
+		Values     []float64         `json:"values"`
+		Timestamps []int64           `json:"timestamps"`
 	}
-	return contains
-}
-
-type suite struct{ t *testing.T }
-
-func newSuite(t *testing.T) *suite { return &suite{t: t} }
-
-func (s *suite) noError(err error) {
-	s.t.Helper()
+	line := &jsonLine{
+		Metric:     m,
+		Values:     []float64{1.34},
+		Timestamps: []int64{time.Now().UnixNano() / 1e6},
+	}
+	data, err := json.Marshal(&line)
 	if err != nil {
-		s.t.Errorf("unexpected error %v", err)
-		s.t.FailNow()
+		panic(fmt.Errorf("cannot marshal JSON: %w", err))
 	}
+	data = append(data, '\n')
+	return string(data)
 }
 
-func (s *suite) equalInt(a, b int) {
-	s.t.Helper()
-	if a != b {
-		s.t.Errorf("%d not equal %d", a, b)
-		s.t.FailNow()
-	}
-}
+const alphabetSample = `qwertyuiopasdfghjklzxcvbnm`
 
-func (s *suite) greaterThan(a, b int) {
-	s.t.Helper()
-	if a <= b {
-		s.t.Errorf("%d less or equal then %d", a, b)
-		s.t.FailNow()
+func generateSizedRandomString(size int) string {
+	dst := make([]byte, size)
+	for i := range dst {
+		dst[i] = alphabetSample[rand.Intn(len(alphabetSample))]
 	}
+	return string(dst)
 }

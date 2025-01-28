@@ -7,6 +7,7 @@ import (
 	"io"
 
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/logger"
+	"github.com/VictoriaMetrics/VictoriaMetrics/lib/slicesutil"
 )
 
 // TableSearch is a reusable cursor used for searching in the Table.
@@ -58,7 +59,7 @@ func (ts *TableSearch) reset() {
 // Init initializes ts for searching in the tb.
 //
 // MustClose must be called when the ts is no longer needed.
-func (ts *TableSearch) Init(tb *Table) {
+func (ts *TableSearch) Init(tb *Table, sparse bool) {
 	if ts.needClosing {
 		logger.Panicf("BUG: missing MustClose call before the next call to Init")
 	}
@@ -71,12 +72,9 @@ func (ts *TableSearch) Init(tb *Table) {
 	ts.pws = ts.tb.getParts(ts.pws[:0])
 
 	// Initialize the psPool.
-	if n := len(ts.pws) - cap(ts.psPool); n > 0 {
-		ts.psPool = append(ts.psPool[:cap(ts.psPool)], make([]partSearch, n)...)
-	}
-	ts.psPool = ts.psPool[:len(ts.pws)]
+	ts.psPool = slicesutil.SetLength(ts.psPool, len(ts.pws))
 	for i, pw := range ts.pws {
-		ts.psPool[i].Init(pw.p)
+		ts.psPool[i].Init(pw.p, sparse)
 	}
 }
 
@@ -89,23 +87,19 @@ func (ts *TableSearch) Seek(k []byte) {
 	ts.err = nil
 
 	// Initialize the psHeap.
-	var errors []error
 	ts.psHeap = ts.psHeap[:0]
 	for i := range ts.psPool {
 		ps := &ts.psPool[i]
 		ps.Seek(k)
 		if !ps.NextItem() {
 			if err := ps.Error(); err != nil {
-				errors = append(errors, err)
+				// Return only the first error, since it has no sense in returning all errors.
+				ts.err = fmt.Errorf("cannot seek %q: %w", k, err)
+				return
 			}
 			continue
 		}
 		ts.psHeap = append(ts.psHeap, ps)
-	}
-	if len(errors) > 0 {
-		// Return only the first error, since it has no sense in returning all errors.
-		ts.err = fmt.Errorf("cannot seek %q: %w", k, errors[0])
-		return
 	}
 	if len(ts.psHeap) == 0 {
 		ts.err = io.EOF
@@ -211,11 +205,11 @@ func (psh *partSearchHeap) Swap(i, j int) {
 	x[i], x[j] = x[j], x[i]
 }
 
-func (psh *partSearchHeap) Push(x interface{}) {
+func (psh *partSearchHeap) Push(x any) {
 	*psh = append(*psh, x.(*partSearch))
 }
 
-func (psh *partSearchHeap) Pop() interface{} {
+func (psh *partSearchHeap) Pop() any {
 	a := *psh
 	v := a[len(a)-1]
 	*psh = a[:len(a)-1]

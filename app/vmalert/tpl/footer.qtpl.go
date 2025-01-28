@@ -6,81 +6,78 @@ package tpl
 
 //line app/vmalert/tpl/footer.qtpl:1
 import (
+	"net/http"
+
+	"github.com/VictoriaMetrics/VictoriaMetrics/app/vmalert/utils"
+)
+
+//line app/vmalert/tpl/footer.qtpl:8
+import (
 	qtio422016 "io"
 
 	qt422016 "github.com/valyala/quicktemplate"
 )
 
-//line app/vmalert/tpl/footer.qtpl:1
+//line app/vmalert/tpl/footer.qtpl:8
 var (
 	_ = qtio422016.Copy
 	_ = qt422016.AcquireByteBuffer
 )
 
-//line app/vmalert/tpl/footer.qtpl:1
-func StreamFooter(qw422016 *qt422016.Writer) {
-//line app/vmalert/tpl/footer.qtpl:1
+//line app/vmalert/tpl/footer.qtpl:8
+func StreamFooter(qw422016 *qt422016.Writer, r *http.Request) {
+//line app/vmalert/tpl/footer.qtpl:8
+	qw422016.N().S(`
+    `)
+//line app/vmalert/tpl/footer.qtpl:9
+	prefix := utils.Prefix(r.URL.Path)
+
+//line app/vmalert/tpl/footer.qtpl:9
 	qw422016.N().S(`
         </main>
-        <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.0.2/dist/js/bootstrap.bundle.min.js" integrity="sha384-MrcW6ZMFYlzcLA8Nl+NtUVF0sA7MsXsP1UyJoMp4YLEuNSfAP+JcXn/tWtIaxVXM" crossorigin="anonymous"></script>
-        <script src="https://code.jquery.com/jquery-3.3.1.min.js"></script>
-        <script type="text/javascript">
-            function expandAll() {
-               $('.collapse').addClass('show');
-            }
-            function collapseAll() {
-               $('.collapse').removeClass('show');
-            }
-
-            $(document).ready(function() {
-              // prevent collapse logic on link click
-              $(".group-heading a").click(function(e) {
-                e.stopPropagation();
-              });
-
-              $(".group-heading").click(function(e) {
-                 let target = $(this).attr('data-bs-target');
-                 let el = $('#'+target);
-                  new bootstrap.Collapse(el, {
-                    toggle: true
-                  });
-              });
-
-              var hash = window.location.hash.substr(1);
-              let group = $('#'+hash);
-              if (group.length > 0) {
-                group.click();
-              }
-            });
-        </script>
+        <script src="`)
+//line app/vmalert/tpl/footer.qtpl:11
+	qw422016.E().S(prefix)
+//line app/vmalert/tpl/footer.qtpl:11
+	qw422016.N().S(`static/js/jquery-3.6.0.min.js" type="text/javascript"></script>
+        <script src="`)
+//line app/vmalert/tpl/footer.qtpl:12
+	qw422016.E().S(prefix)
+//line app/vmalert/tpl/footer.qtpl:12
+	qw422016.N().S(`static/js/bootstrap.bundle.min.js" type="text/javascript"></script>
+        <script src="`)
+//line app/vmalert/tpl/footer.qtpl:13
+	qw422016.E().S(prefix)
+//line app/vmalert/tpl/footer.qtpl:13
+	qw422016.N().S(`static/js/custom.js" type="text/javascript"></script>
     </body>
 </html>
 `)
-//line app/vmalert/tpl/footer.qtpl:36
+//line app/vmalert/tpl/footer.qtpl:16
 }
 
-//line app/vmalert/tpl/footer.qtpl:36
-func WriteFooter(qq422016 qtio422016.Writer) {
-//line app/vmalert/tpl/footer.qtpl:36
+//line app/vmalert/tpl/footer.qtpl:16
+func WriteFooter(qq422016 qtio422016.Writer, r *http.Request) {
+//line app/vmalert/tpl/footer.qtpl:16
 	qw422016 := qt422016.AcquireWriter(qq422016)
-//line app/vmalert/tpl/footer.qtpl:36
-	StreamFooter(qw422016)
-//line app/vmalert/tpl/footer.qtpl:36
+//line app/vmalert/tpl/footer.qtpl:16
+	StreamFooter(qw422016, r)
+//line app/vmalert/tpl/footer.qtpl:16
 	qt422016.ReleaseWriter(qw422016)
-//line app/vmalert/tpl/footer.qtpl:36
+//line app/vmalert/tpl/footer.qtpl:16
 }
 
-//line app/vmalert/tpl/footer.qtpl:36
-func Footer() string {
-//line app/vmalert/tpl/footer.qtpl:36
+//line app/vmalert/tpl/footer.qtpl:16
+func Footer(r *http.Request) string {
+//line app/vmalert/tpl/footer.qtpl:16
 	qb422016 := qt422016.AcquireByteBuffer()
-//line app/vmalert/tpl/footer.qtpl:36
-	WriteFooter(qb422016)
-//line app/vmalert/tpl/footer.qtpl:36
+//line app/vmalert/tpl/footer.qtpl:16
+	WriteFooter(qb422016, r)
+//line app/vmalert/tpl/footer.qtpl:16
 	qs422016 := string(qb422016.B)
-//line app/vmalert/tpl/footer.qtpl:36
+//line app/vmalert/tpl/footer.qtpl:16
 	qt422016.ReleaseByteBuffer(qb422016)
-//line app/vmalert/tpl/footer.qtpl:36
+//line app/vmalert/tpl/footer.qtpl:16
 	return qs422016
-//line app/vmalert/tpl/footer.qtpl:36
+//line app/vmalert/tpl/footer.qtpl:16
 }

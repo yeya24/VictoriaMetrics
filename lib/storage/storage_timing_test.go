@@ -17,10 +17,7 @@ func BenchmarkStorageAddRows(b *testing.B) {
 
 func benchmarkStorageAddRows(b *testing.B, rowsPerBatch int) {
 	path := fmt.Sprintf("BenchmarkStorageAddRows_%d", rowsPerBatch)
-	s, err := OpenStorage(path, 0, 0, 0)
-	if err != nil {
-		b.Fatalf("cannot open storage at %q: %s", path, err)
-	}
+	s := MustOpenStorage(path, 0, 0, 0)
 	defer func() {
 		s.MustClose()
 		if err := os.RemoveAll(path); err != nil {
@@ -28,7 +25,7 @@ func benchmarkStorageAddRows(b *testing.B, rowsPerBatch int) {
 		}
 	}()
 
-	var globalOffset uint64
+	var globalOffset atomic.Uint64
 
 	b.SetBytes(int64(rowsPerBatch))
 	b.ReportAllocs()
@@ -42,16 +39,14 @@ func benchmarkStorageAddRows(b *testing.B, rowsPerBatch int) {
 			{[]byte("instance"), []byte("1.2.3.4")},
 		}
 		for pb.Next() {
-			offset := int(atomic.AddUint64(&globalOffset, uint64(rowsPerBatch)))
+			offset := int(globalOffset.Add(uint64(rowsPerBatch)))
 			for i := 0; i < rowsPerBatch; i++ {
 				mr := &mrs[i]
 				mr.MetricNameRaw = mn.marshalRaw(mr.MetricNameRaw[:0])
 				mr.Timestamp = int64(offset + i)
 				mr.Value = float64(offset + i)
 			}
-			if err := s.AddRows(mrs, defaultPrecisionBits); err != nil {
-				panic(fmt.Errorf("cannot add rows to storage: %w", err))
-			}
+			s.AddRows(mrs, defaultPrecisionBits)
 		}
 	})
 	b.StopTimer()

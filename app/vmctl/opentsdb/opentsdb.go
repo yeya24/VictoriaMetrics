@@ -3,7 +3,7 @@ package opentsdb
 import (
 	"encoding/json"
 	"fmt"
-	"io/ioutil"
+	"io"
 	"log"
 	"net/http"
 	"strings"
@@ -26,7 +26,7 @@ type Retention struct {
 	FirstOrder  string
 	SecondOrder string
 	AggTime     string
-	// The actual ranges will will attempt to query (as offsets from now)
+	// The actual ranges will attempt to query (as offsets from now)
 	QueryRanges []TimeRange
 }
 
@@ -46,6 +46,9 @@ type Client struct {
 	Filters    []string
 	Normalize  bool
 	HardTS     int64
+	MsecsTime  bool
+
+	c *http.Client
 }
 
 // Config contains fields required
@@ -59,6 +62,7 @@ type Config struct {
 	Filters    []string
 	Normalize  bool
 	MsecsTime  bool
+	Transport  *http.Transport
 }
 
 // TimeRange contains data about time ranges to query
@@ -71,18 +75,11 @@ type TimeRange struct {
 type MetaResults struct {
 	Type    string `json:"type"`
 	Results []Meta `json:"results"`
-	//metric       string
-	//tags         interface{}
-	//limit        int
-	//time         int
-	//startIndex   int
-	//totalResults int
 }
 
 // Meta A meta object about a metric
 // only contain the tags/etc. and no data
 type Meta struct {
-	//tsuid  string
 	Metric string            `json:"metric"`
 	Tags   map[string]string `json:"tags"`
 }
@@ -106,7 +103,8 @@ type Metric struct {
 // FindMetrics discovers all metrics that OpenTSDB knows about (given a filter)
 // e.g. /api/suggest?type=metrics&q=system&max=100000
 func (c Client) FindMetrics(q string) ([]string, error) {
-	resp, err := http.Get(q)
+
+	resp, err := c.c.Get(q)
 	if err != nil {
 		return nil, fmt.Errorf("failed to send GET request to %q: %s", q, err)
 	}
@@ -114,7 +112,7 @@ func (c Client) FindMetrics(q string) ([]string, error) {
 		return nil, fmt.Errorf("Bad return from OpenTSDB: %q: %v", resp.StatusCode, resp)
 	}
 	defer func() { _ = resp.Body.Close() }()
-	body, err := ioutil.ReadAll(resp.Body)
+	body, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return nil, fmt.Errorf("could not retrieve metric data from %q: %s", q, err)
 	}
@@ -130,7 +128,7 @@ func (c Client) FindMetrics(q string) ([]string, error) {
 // e.g. /api/search/lookup?m=system.load5&limit=1000000
 func (c Client) FindSeries(metric string) ([]Meta, error) {
 	q := fmt.Sprintf("%s/api/search/lookup?m=%s&limit=%d", c.Addr, metric, c.Limit)
-	resp, err := http.Get(q)
+	resp, err := c.c.Get(q)
 	if err != nil {
 		return nil, fmt.Errorf("failed to set GET request to %q: %s", q, err)
 	}
@@ -138,7 +136,7 @@ func (c Client) FindSeries(metric string) ([]Meta, error) {
 		return nil, fmt.Errorf("Bad return from OpenTSDB: %q: %v", resp.StatusCode, resp)
 	}
 	defer func() { _ = resp.Body.Close() }()
-	body, err := ioutil.ReadAll(resp.Body)
+	body, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return nil, fmt.Errorf("could not retrieve series data from %q: %s", q, err)
 	}
@@ -152,7 +150,7 @@ func (c Client) FindSeries(metric string) ([]Meta, error) {
 
 // GetData actually retrieves data for a series at a specified time range
 // e.g. /api/query?start=1&end=200&m=sum:1m-avg-none:system.load5{host=host1}
-func (c Client) GetData(series Meta, rt RetentionMeta, start int64, end int64) (Metric, error) {
+func (c Client) GetData(series Meta, rt RetentionMeta, start int64, end int64, mSecs bool) (Metric, error) {
 	/*
 		First, build our tag string.
 		It's literally just key=value,key=value,...
@@ -183,22 +181,32 @@ func (c Client) GetData(series Meta, rt RetentionMeta, start int64, end int64) (
 		series.Metric, tagStr)
 
 	q := fmt.Sprintf("%s/api/query?%s", c.Addr, queryStr)
-	resp, err := http.Get(q)
+	resp, err := c.c.Get(q)
 	if err != nil {
 		return Metric{}, fmt.Errorf("failed to send GET request to %q: %s", q, err)
 	}
+	/*
+		There are three potential failures here, none of which should kill the entire
+		migration run:
+		1. bad response code
+		2. failure to read response body
+		3. bad format of response body
+	*/
 	if resp.StatusCode != 200 {
-		return Metric{}, fmt.Errorf("Bad return from OpenTSDB: %q: %v", resp.StatusCode, resp)
+		log.Printf("bad response code from OpenTSDB query %v for %q...skipping", resp.StatusCode, q)
+		return Metric{}, nil
 	}
 	defer func() { _ = resp.Body.Close() }()
-	body, err := ioutil.ReadAll(resp.Body)
+	body, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return Metric{}, fmt.Errorf("could not retrieve series data from %q: %s", q, err)
+		log.Println("couldn't read response body from OpenTSDB query...skipping")
+		return Metric{}, nil
 	}
 	var output []OtsdbMetric
 	err = json.Unmarshal(body, &output)
 	if err != nil {
-		return Metric{}, fmt.Errorf("failed to unmarshal response from %q [%v]: %s", q, body, err)
+		log.Printf("couldn't marshall response body from OpenTSDB query (%s)...skipping", body)
+		return Metric{}, nil
 	}
 	/*
 		We expect results to look like:
@@ -227,6 +235,8 @@ func (c Client) GetData(series Meta, rt RetentionMeta, start int64, end int64) (
 		An empty array doesn't cast to a OtsdbMetric struct well, and there's no reason to try, so we should just skip it
 		Because we're trying to migrate data without transformations, seeing aggregate tags could mean
 		we're dropping series on the floor.
+
+		In all "bad" cases, we don't end the migration, we just don't process that particular message
 	*/
 	if len(output) < 1 {
 		// no results returned...return an empty object without error
@@ -234,11 +244,11 @@ func (c Client) GetData(series Meta, rt RetentionMeta, start int64, end int64) (
 	}
 	if len(output) > 1 {
 		// multiple series returned for a single query. We can't process this right, so...
-		return Metric{}, fmt.Errorf("Query returned multiple results: %v", output)
+		return Metric{}, nil
 	}
 	if len(output[0].AggregateTags) > 0 {
 		// This failure means we've suppressed potential series somehow...
-		return Metric{}, fmt.Errorf("Query somehow has aggregate tags: %v", output[0].AggregateTags)
+		return Metric{}, nil
 	}
 	data := Metric{}
 	data.Metric = output[0].Metric
@@ -249,7 +259,7 @@ func (c Client) GetData(series Meta, rt RetentionMeta, start int64, end int64) (
 	*/
 	data, err = modifyData(data, c.Normalize)
 	if err != nil {
-		return Metric{}, fmt.Errorf("invalid series data from %q: %s", q, err)
+		return Metric{}, nil
 	}
 
 	/*
@@ -260,7 +270,11 @@ func (c Client) GetData(series Meta, rt RetentionMeta, start int64, end int64) (
 		then convert the timestamp back to something reasonable.
 	*/
 	for ts, val := range output[0].Dps {
-		data.Timestamps = append(data.Timestamps, ts)
+		if !mSecs {
+			data.Timestamps = append(data.Timestamps, ts*1000)
+		} else {
+			data.Timestamps = append(data.Timestamps, ts)
+		}
 		data.Values = append(data.Values, val)
 	}
 	return data, nil
@@ -271,6 +285,7 @@ func (c Client) GetData(series Meta, rt RetentionMeta, start int64, end int64) (
 func NewClient(cfg Config) (*Client, error) {
 	var retentions []Retention
 	offsetPrint := int64(time.Now().Unix())
+	// convert a number of days to seconds
 	offsetSecs := cfg.Offset * 24 * 60 * 60
 	if cfg.MsecsTime {
 		// 1000000 == Nanoseconds -> Milliseconds difference
@@ -291,7 +306,7 @@ func NewClient(cfg Config) (*Client, error) {
 		*/
 		offsetPrint = offsetPrint - offsetSecs
 	}
-	log.Println(fmt.Sprintf("Will collect data starting at TS %v", offsetPrint))
+	log.Printf("Will collect data starting at TS %v", offsetPrint)
 	for _, r := range cfg.Retentions {
 		ret, err := convertRetention(r, offsetSecs, cfg.MsecsTime)
 		if err != nil {
@@ -306,6 +321,8 @@ func NewClient(cfg Config) (*Client, error) {
 		Filters:    cfg.Filters,
 		Normalize:  cfg.Normalize,
 		HardTS:     cfg.HardTS,
+		MsecsTime:  cfg.MsecsTime,
+		c:          &http.Client{Transport: cfg.Transport},
 	}
 	return client, nil
 }

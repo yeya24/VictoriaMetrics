@@ -3,16 +3,18 @@ package vm
 import (
 	"bufio"
 	"compress/gzip"
+	"context"
 	"errors"
 	"fmt"
 	"io"
-	"io/ioutil"
-	"math"
 	"net/http"
 	"strings"
 	"sync"
 	"time"
 
+	"github.com/VictoriaMetrics/VictoriaMetrics/app/vmctl/backoff"
+	"github.com/VictoriaMetrics/VictoriaMetrics/app/vmctl/barpool"
+	"github.com/VictoriaMetrics/VictoriaMetrics/app/vmctl/limiter"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/decimal"
 )
 
@@ -23,6 +25,8 @@ type Config struct {
 	//   --httpListenAddr value for single node version
 	//   --httpListenAddr value of vmselect  component for cluster version
 	Addr string
+	// Transport allows specifying custom http.Transport
+	Transport *http.Transport
 	// Concurrency defines number of worker
 	// performing the import requests concurrently
 	Concurrency uint8
@@ -47,6 +51,11 @@ type Config struct {
 	RoundDigits int
 	// ExtraLabels that will be added to all imported series. Must be in label=value format.
 	ExtraLabels []string
+	// RateLimit defines a data transfer speed in bytes per second.
+	// Is applied to each worker (see Concurrency) independently.
+	RateLimit int64
+	// Backoff defines backoff policy for retries
+	Backoff *backoff.Backoff
 }
 
 // Importer performs insertion of timeseries
@@ -54,6 +63,7 @@ type Config struct {
 // see https://docs.victoriametrics.com/#how-to-import-time-series-data
 type Importer struct {
 	addr       string
+	client     *http.Client
 	importPath string
 	compress   bool
 	user       string
@@ -63,10 +73,13 @@ type Importer struct {
 	input  chan *TimeSeries
 	errors chan *ImportError
 
+	rl *limiter.Limiter
+
 	wg   sync.WaitGroup
 	once sync.Once
 
-	s *stats
+	s       *stats
+	backoff *backoff.Backoff
 }
 
 // ResetStats resets im stats.
@@ -98,7 +111,7 @@ func AddExtraLabelsToImportPath(path string, extraLabels []string) (string, erro
 }
 
 // NewImporter creates new Importer for the given cfg.
-func NewImporter(cfg Config) (*Importer, error) {
+func NewImporter(ctx context.Context, cfg Config) (*Importer, error) {
 	if cfg.Concurrency < 1 {
 		return nil, fmt.Errorf("concurrency can't be lower than 1")
 	}
@@ -109,7 +122,7 @@ func NewImporter(cfg Config) (*Importer, error) {
 	importPath := addr + "/api/v1/import"
 	if cfg.AccountID != "" {
 		// if cluster version
-		// see https://docs.victoriametrics.com/Cluster-VictoriaMetrics.html#url-format
+		// see https://docs.victoriametrics.com/cluster-victoriametrics/#url-format
 		importPath = fmt.Sprintf("%s/insert/%s/prometheus/api/v1/import", addr, cfg.AccountID)
 	}
 	importPath, err := AddExtraLabelsToImportPath(importPath, cfg.ExtraLabels)
@@ -117,15 +130,23 @@ func NewImporter(cfg Config) (*Importer, error) {
 		return nil, err
 	}
 
+	client := &http.Client{}
+	if cfg.Transport != nil {
+		client.Transport = cfg.Transport
+	}
+
 	im := &Importer{
 		addr:       addr,
+		client:     client,
 		importPath: importPath,
 		compress:   cfg.Compress,
 		user:       cfg.User,
 		password:   cfg.Password,
+		rl:         limiter.NewLimiter(cfg.RateLimit),
 		close:      make(chan struct{}),
 		input:      make(chan *TimeSeries, cfg.Concurrency*4),
 		errors:     make(chan *ImportError, cfg.Concurrency),
+		backoff:    cfg.Backoff,
 	}
 	if err := im.Ping(); err != nil {
 		return nil, fmt.Errorf("ping to %q failed: %s", addr, err)
@@ -137,21 +158,28 @@ func NewImporter(cfg Config) (*Importer, error) {
 
 	im.wg.Add(int(cfg.Concurrency))
 	for i := 0; i < int(cfg.Concurrency); i++ {
-		go func() {
+		pbPrefix := fmt.Sprintf(`{{ green "VM worker %d:" }}`, i)
+		bar := barpool.AddWithTemplate(pbPrefix+pbTpl, 0)
+
+		go func(bar barpool.Bar) {
 			defer im.wg.Done()
-			im.startWorker(cfg.BatchSize, cfg.SignificantFigures, cfg.RoundDigits)
-		}()
+			im.startWorker(ctx, bar, cfg.BatchSize, cfg.SignificantFigures, cfg.RoundDigits)
+		}(bar)
 	}
 	im.ResetStats()
 	return im, nil
 }
 
+const pbTpl = `{{ (cycle . "←" "↖" "↑" "↗" "→" "↘" "↓" "↙" ) }} {{speed . "%s samples/s"}}`
+
 // ImportError is type of error generated
 // in case of unsuccessful import request
 type ImportError struct {
-	// The batch of timeseries that failed
+	// The batch of timeseries processed by importer at the moment
 	Batch []*TimeSeries
 	// The error that appeared during insert
+	// If err is nil - no error happened and Batch
+	// Is the latest delivered Batch.
 	Err error
 }
 
@@ -161,52 +189,68 @@ func (im *Importer) Errors() chan *ImportError { return im.errors }
 
 // Input returns a channel for sending timeseries
 // that need to be imported
-func (im *Importer) Input() chan<- *TimeSeries { return im.input }
+func (im *Importer) Input(ts *TimeSeries) error {
+	select {
+	case <-im.close:
+		return fmt.Errorf("importer is closed")
+	case im.input <- ts:
+		return nil
+	case err := <-im.errors:
+		if err != nil && err.Err != nil {
+			return err.Err
+		}
+		return fmt.Errorf("process aborted")
+	}
+}
 
 // Close sends signal to all goroutines to exit
 // and waits until they are finished
 func (im *Importer) Close() {
 	im.once.Do(func() {
 		close(im.close)
+		close(im.input)
 		im.wg.Wait()
 		close(im.errors)
 	})
 }
 
-func (im *Importer) startWorker(batchSize, significantFigures, roundDigits int) {
+func (im *Importer) startWorker(ctx context.Context, bar barpool.Bar, batchSize, significantFigures, roundDigits int) {
 	var batch []*TimeSeries
 	var dataPoints int
 	var waitForBatch time.Time
 	for {
 		select {
 		case <-im.close:
-			if err := im.Import(batch); err != nil {
-				im.errors <- &ImportError{
-					Batch: batch,
-					Err:   err,
-				}
+			for ts := range im.input {
+				ts = roundTimeseriesValue(ts, significantFigures, roundDigits)
+				batch = append(batch, ts)
 			}
+			exitErr := &ImportError{
+				Batch: batch,
+			}
+			retryableFunc := func() error { return im.Import(batch) }
+			_, err := im.backoff.Retry(ctx, retryableFunc)
+			if err != nil {
+				exitErr.Err = err
+			}
+			im.errors <- exitErr
 			return
-		case ts := <-im.input:
+		case ts, ok := <-im.input:
+			if !ok {
+				continue
+			}
 			// init waitForBatch when first
 			// value was received
 			if waitForBatch.IsZero() {
 				waitForBatch = time.Now()
 			}
 
-			if significantFigures > 0 {
-				for i, v := range ts.Values {
-					ts.Values[i] = decimal.RoundToSignificantFigures(v, significantFigures)
-				}
-			}
-			if roundDigits < 100 {
-				for i, v := range ts.Values {
-					ts.Values[i] = decimal.RoundToDecimalDigits(v, roundDigits)
-				}
-			}
-
+			ts = roundTimeseriesValue(ts, significantFigures, roundDigits)
 			batch = append(batch, ts)
 			dataPoints += len(ts.Values)
+
+			bar.Add(len(ts.Values))
+
 			if dataPoints < batchSize {
 				continue
 			}
@@ -214,7 +258,7 @@ func (im *Importer) startWorker(batchSize, significantFigures, roundDigits int) 
 			im.s.idleDuration += time.Since(waitForBatch)
 			im.s.Unlock()
 
-			if err := im.flush(batch); err != nil {
+			if err := im.flush(ctx, batch); err != nil {
 				im.errors <- &ImportError{
 					Batch: batch,
 					Err:   err,
@@ -222,50 +266,36 @@ func (im *Importer) startWorker(batchSize, significantFigures, roundDigits int) 
 				// make a new batch, since old one was referenced as err
 				batch = make([]*TimeSeries, len(batch))
 			}
-			batch = batch[:0]
 			dataPoints = 0
+			batch = batch[:0]
 			waitForBatch = time.Now()
 		}
 	}
 }
 
-const (
-	// TODO: make configurable
-	backoffRetries     = 5
-	backoffFactor      = 1.7
-	backoffMinDuration = time.Second
-)
-
-func (im *Importer) flush(b []*TimeSeries) error {
-	var err error
-	for i := 0; i < backoffRetries; i++ {
-		err = im.Import(b)
-		if err == nil {
-			return nil
-		}
-		if errors.Is(err, ErrBadRequest) {
-			return err // fail fast if not recoverable
-		}
-		im.s.Lock()
-		im.s.retries++
-		im.s.Unlock()
-		backoff := float64(backoffMinDuration) * math.Pow(backoffFactor, float64(i))
-		time.Sleep(time.Duration(backoff))
+func (im *Importer) flush(ctx context.Context, b []*TimeSeries) error {
+	retryableFunc := func() error { return im.Import(b) }
+	attempts, err := im.backoff.Retry(ctx, retryableFunc)
+	if err != nil {
+		return fmt.Errorf("import failed with %d retries: %s", attempts, err)
 	}
-	return fmt.Errorf("import failed with %d retries: %s", backoffRetries, err)
+	im.s.Lock()
+	im.s.retries = attempts
+	im.s.Unlock()
+	return nil
 }
 
 // Ping sends a ping to im.addr.
 func (im *Importer) Ping() error {
 	url := fmt.Sprintf("%s/health", im.addr)
-	req, err := http.NewRequest("GET", url, nil)
+	req, err := http.NewRequest(http.MethodGet, url, nil)
 	if err != nil {
 		return fmt.Errorf("cannot create request to %q: %s", im.addr, err)
 	}
 	if im.user != "" {
 		req.SetBasicAuth(im.user, im.password)
 	}
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := im.client.Do(req)
 	if err != nil {
 		return err
 	}
@@ -282,7 +312,7 @@ func (im *Importer) Import(tsBatch []*TimeSeries) error {
 	}
 
 	pr, pw := io.Pipe()
-	req, err := http.NewRequest("POST", im.importPath, pr)
+	req, err := http.NewRequest(http.MethodPost, im.importPath, pr)
 	if err != nil {
 		return fmt.Errorf("cannot create request to %q: %s", im.addr, err)
 	}
@@ -295,18 +325,19 @@ func (im *Importer) Import(tsBatch []*TimeSeries) error {
 
 	errCh := make(chan error)
 	go func() {
-		errCh <- do(req)
+		errCh <- im.do(req)
 		close(errCh)
 	}()
 
 	w := io.Writer(pw)
 	if im.compress {
-		zw, err := gzip.NewWriterLevel(pw, 1)
+		zw, err := gzip.NewWriterLevel(w, 1)
 		if err != nil {
 			return fmt.Errorf("unexpected error when creating gzip writer: %s", err)
 		}
 		w = zw
 	}
+	w = limiter.NewWriteLimiter(w, im.rl)
 	bw := bufio.NewWriterSize(w, 16*1024)
 
 	var totalSamples, totalBytes int
@@ -321,8 +352,8 @@ func (im *Importer) Import(tsBatch []*TimeSeries) error {
 	if err := bw.Flush(); err != nil {
 		return err
 	}
-	if im.compress {
-		err := w.(*gzip.Writer).Close()
+	if closer, ok := w.(io.Closer); ok {
+		err := closer.Close()
 		if err != nil {
 			return err
 		}
@@ -348,8 +379,8 @@ func (im *Importer) Import(tsBatch []*TimeSeries) error {
 // ErrBadRequest represents bad request error.
 var ErrBadRequest = errors.New("bad request")
 
-func do(req *http.Request) error {
-	resp, err := http.DefaultClient.Do(req)
+func (im *Importer) do(req *http.Request) error {
+	resp, err := im.client.Do(req)
 	if err != nil {
 		return fmt.Errorf("unexpected error when performing request: %s", err)
 	}
@@ -357,7 +388,7 @@ func do(req *http.Request) error {
 		_ = resp.Body.Close()
 	}()
 	if resp.StatusCode != http.StatusNoContent {
-		body, err := ioutil.ReadAll(resp.Body)
+		body, err := io.ReadAll(resp.Body)
 		if err != nil {
 			return fmt.Errorf("failed to read response body for status code %d: %s", resp.StatusCode, err)
 		}
@@ -381,4 +412,19 @@ func byteCountSI(b int64) string {
 	}
 	return fmt.Sprintf("%.1f %cB",
 		float64(b)/float64(div), "kMGTPE"[exp])
+}
+
+func roundTimeseriesValue(ts *TimeSeries, significantFigures, roundDigits int) *TimeSeries {
+	if significantFigures > 0 {
+		for i, v := range ts.Values {
+			ts.Values[i] = decimal.RoundToSignificantFigures(v, significantFigures)
+		}
+	}
+	if roundDigits < 100 {
+		for i, v := range ts.Values {
+			ts.Values[i] = decimal.RoundToDecimalDigits(v, roundDigits)
+		}
+	}
+
+	return ts
 }

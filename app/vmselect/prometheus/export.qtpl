@@ -1,9 +1,11 @@
 {% import (
 	"bytes"
+	"math"
 	"strings"
 	"time"
 
 	"github.com/valyala/quicktemplate"
+	"github.com/VictoriaMetrics/VictoriaMetrics/lib/querytracer"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/storage"
 ) %}
 
@@ -22,6 +24,7 @@
 	{% endfor %}
 {% endfunc %}
 
+{%code const rfc3339Milli = "2006-01-02T15:04:05.999Z07:00" %}
 {% func exportCSVField(mn *storage.MetricName, fieldName string, timestamp int64, value float64) %}
 	{% if fieldName == "__value__" %}
 		{%f= value %}
@@ -43,7 +46,7 @@
 		{% case "rfc3339" %}
 			{% code
 				bb := quicktemplate.AcquireByteBuffer()
-				bb.B = time.Unix(timestamp/1000, (timestamp%1000)*1e6).AppendFormat(bb.B[:0], time.RFC3339)
+				bb.B = time.Unix(timestamp/1000, (timestamp%1000)*1e6).AppendFormat(bb.B[:0], rfc3339Milli)
 			%}
 			{%z= bb.B %}
 			{% code
@@ -97,10 +100,10 @@
 		"values":[
 			{% if len(xb.values) > 0 %}
 				{% code values := xb.values %}
-				{%f= values[0] %}
+					{%= convertValueToSpecialJSON(values[0]) %}
 				{% code values = values[1:] %}
 				{% for _, v := range values %}
-					,{%f= v %}
+					,{%= convertValueToSpecialJSON(v) %}
 				{% endfor %}
 			{% endif %}
 		],
@@ -124,31 +127,22 @@
 }
 {% endfunc %}
 
-{% func ExportPromAPIResponse(resultsCh <-chan *quicktemplate.ByteBuffer) %}
+{% func ExportPromAPIHeader() %}
 {
 	"status":"success",
 	"data":{
 		"resultType":"matrix",
 		"result":[
-			{% code bb, ok := <-resultsCh %}
-			{% if ok %}
-				{%z= bb.B %}
-				{% code quicktemplate.ReleaseByteBuffer(bb) %}
-				{% for bb := range resultsCh %}
-					,{%z= bb.B %}
-					{% code quicktemplate.ReleaseByteBuffer(bb) %}
-				{% endfor %}
-			{% endif %}
-		]
-	}
-}
 {% endfunc %}
 
-{% func ExportStdResponse(resultsCh <-chan *quicktemplate.ByteBuffer) %}
-	{% for bb := range resultsCh %}
-		{%z= bb.B %}
-		{% code quicktemplate.ReleaseByteBuffer(bb) %}
-	{% endfor %}
+{% func ExportPromAPIFooter(qt *querytracer.Tracer) %}
+		]
+	}
+	{% code
+		qt.Donef("export format=promapi")
+	%}
+	{%= dumpQueryTrace(qt) %}
+}
 {% endfunc %}
 
 {% func prometheusMetricName(mn *storage.MetricName) %}
@@ -156,13 +150,50 @@
 	{% if len(mn.Tags) > 0 %}
 	{
 		{% code tags := mn.Tags %}
-		{%z= tags[0].Key %}={%qz= tags[0].Value %}
+		{%z= tags[0].Key %}={%= escapePrometheusLabel(tags[0].Value) %}
 		{% code tags = tags[1:] %}
 		{% for i := range tags %}
 			{% code tag := &tags[i] %}
-			,{%z= tag.Key %}={%qz= tag.Value %}
+			,{%z= tag.Key %}={%= escapePrometheusLabel(tag.Value) %}
 		{% endfor %}
 	}
 	{% endif %}
 {% endfunc %}
+
+{% func convertValueToSpecialJSON(v float64) %}
+	{% if math.IsNaN(v) %}
+		null
+	{% elseif math.IsInf(v, 0) %}
+		{% if v > 0 %}
+			"Infinity"
+		{% else %}
+			"-Infinity"
+		{% endif %}
+	{% else %}
+		{%f= v %}
+	{% endif %}
+{% endfunc %}
+
+{% func escapePrometheusLabel(b []byte) %}
+	"
+	{% for len(b) > 0 %}
+		{% code n := bytes.IndexAny(b, "\\\n\"") %}
+		{% if n < 0 %}
+			{%z= b %}
+			{% break %}
+		{% endif %}
+		{%z= b[:n] %}
+		{% switch b[n] %}
+		{% case '\\' %}
+			\\
+		{% case '\n' %}
+			\n
+		{% case '"' %}
+			\"
+		{% endswitch %}
+		{% code b = b[n+1:] %}
+	{% endfor %}
+	"
+{% endfunc %}
+
 {% endstripspace %}

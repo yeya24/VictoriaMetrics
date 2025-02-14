@@ -7,6 +7,7 @@ import (
 
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/fasttime"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/logger"
+	"github.com/VictoriaMetrics/VictoriaMetrics/lib/slicesutil"
 )
 
 // tableSearch performs searches in the table.
@@ -66,7 +67,7 @@ func (ts *tableSearch) Init(tb *table, tsids []TSID, tr TimeRange) {
 	// Adjust tr.MinTimestamp, so it doesn't obtain data older
 	// than the tb retention.
 	now := int64(fasttime.UnixTimestamp() * 1000)
-	minTimestamp := now - tb.retentionMsecs
+	minTimestamp := now - tb.s.retentionMsecs
 	if tr.MinTimestamp < minTimestamp {
 		tr.MinTimestamp = minTimestamp
 	}
@@ -84,31 +85,24 @@ func (ts *tableSearch) Init(tb *table, tsids []TSID, tr TimeRange) {
 	ts.ptws = tb.GetPartitions(ts.ptws[:0])
 
 	// Initialize the ptsPool.
-	if n := len(ts.ptws) - cap(ts.ptsPool); n > 0 {
-		ts.ptsPool = append(ts.ptsPool[:cap(ts.ptsPool)], make([]partitionSearch, n)...)
-	}
-	ts.ptsPool = ts.ptsPool[:len(ts.ptws)]
+	ts.ptsPool = slicesutil.SetLength(ts.ptsPool, len(ts.ptws))
 	for i, ptw := range ts.ptws {
 		ts.ptsPool[i].Init(ptw.pt, tsids, tr)
 	}
 
 	// Initialize the ptsHeap.
-	var errors []error
 	ts.ptsHeap = ts.ptsHeap[:0]
 	for i := range ts.ptsPool {
 		pts := &ts.ptsPool[i]
 		if !pts.NextBlock() {
 			if err := pts.Error(); err != nil {
-				errors = append(errors, err)
+				// Return only the first error, since it has no sense in returning all errors.
+				ts.err = fmt.Errorf("cannot initialize table search: %w", err)
+				return
 			}
 			continue
 		}
 		ts.ptsHeap = append(ts.ptsHeap, pts)
-	}
-	if len(errors) > 0 {
-		// Return only the first error, since it has no sense in returning all errors.
-		ts.err = fmt.Errorf("cannot initialize table search: %w", errors[0])
-		return
 	}
 	if len(ts.ptsHeap) == 0 {
 		ts.err = io.EOF
@@ -200,11 +194,11 @@ func (ptsh *partitionSearchHeap) Swap(i, j int) {
 	x[i], x[j] = x[j], x[i]
 }
 
-func (ptsh *partitionSearchHeap) Push(x interface{}) {
+func (ptsh *partitionSearchHeap) Push(x any) {
 	*ptsh = append(*ptsh, x.(*partitionSearch))
 }
 
-func (ptsh *partitionSearchHeap) Pop() interface{} {
+func (ptsh *partitionSearchHeap) Pop() any {
 	a := *ptsh
 	v := a[len(a)-1]
 	*ptsh = a[:len(a)-1]

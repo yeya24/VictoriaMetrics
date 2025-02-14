@@ -5,10 +5,11 @@ import (
 
 	"github.com/VictoriaMetrics/VictoriaMetrics/app/vminsert/common"
 	"github.com/VictoriaMetrics/VictoriaMetrics/app/vminsert/relabel"
+	"github.com/VictoriaMetrics/VictoriaMetrics/lib/httpserver"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/prompbmarshal"
 	parserCommon "github.com/VictoriaMetrics/VictoriaMetrics/lib/protoparser/common"
 	parser "github.com/VictoriaMetrics/VictoriaMetrics/lib/protoparser/prometheus"
-	"github.com/VictoriaMetrics/VictoriaMetrics/lib/writeconcurrencylimiter"
+	"github.com/VictoriaMetrics/VictoriaMetrics/lib/protoparser/prometheus/stream"
 	"github.com/VictoriaMetrics/metrics"
 )
 
@@ -27,11 +28,11 @@ func InsertHandler(req *http.Request) error {
 	if err != nil {
 		return err
 	}
-	return writeconcurrencylimiter.Do(func() error {
-		isGzipped := req.Header.Get("Content-Encoding") == "gzip"
-		return parser.ParseStream(req.Body, defaultTimestamp, isGzipped, func(rows []parser.Row) error {
-			return insertRows(rows, extraLabels)
-		}, nil)
+	isGzipped := req.Header.Get("Content-Encoding") == "gzip"
+	return stream.Parse(req.Body, defaultTimestamp, isGzipped, true, func(rows []parser.Row) error {
+		return insertRows(rows, extraLabels)
+	}, func(s string) {
+		httpserver.LogError(req, s)
 	})
 }
 
@@ -53,14 +54,9 @@ func insertRows(rows []parser.Row, extraLabels []prompbmarshal.Label) error {
 			label := &extraLabels[j]
 			ctx.AddLabel(label.Name, label.Value)
 		}
-		if hasRelabeling {
-			ctx.ApplyRelabeling()
-		}
-		if len(ctx.Labels) == 0 {
-			// Skip metric without labels.
+		if !ctx.TryPrepareLabels(hasRelabeling) {
 			continue
 		}
-		ctx.SortLabelsIfNeeded()
 		if err := ctx.WriteDataPoint(nil, ctx.Labels, r.Timestamp, r.Value); err != nil {
 			return err
 		}

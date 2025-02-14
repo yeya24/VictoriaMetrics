@@ -1,22 +1,41 @@
+import { getQueryStringValue } from "../../utils/query-string";
+
+export interface AxisRange {
+  [key: string]: [number, number]
+}
+
 export interface YaxisState {
-    limits: {
-      enable: boolean,
-      range: [number, number]
-    }
+  limits: {
+    enable: boolean,
+    range: AxisRange
+  }
 }
 
 export interface GraphState {
-    yaxis: YaxisState
+  customStep: string
+  yaxis: YaxisState
+  isHistogram: boolean
+  isEmptyHistogram: boolean
+  /** when true, null data values will not cause line breaks */
+  spanGaps: boolean
 }
 
 export type GraphAction =
-    | { type: "TOGGLE_ENABLE_YAXIS_LIMITS" }
-    | { type: "SET_YAXIS_LIMITS", payload: [number, number] }
+  | { type: "TOGGLE_ENABLE_YAXIS_LIMITS" }
+  | { type: "SET_YAXIS_LIMITS", payload: AxisRange }
+  | { type: "SET_CUSTOM_STEP", payload: string}
+  | { type: "SET_IS_HISTOGRAM", payload: boolean }
+  | { type: "SET_IS_EMPTY_HISTOGRAM", payload: boolean }
+  | { type: "SET_SPAN_GAPS", payload: boolean }
 
 export const initialGraphState: GraphState = {
+  customStep: getQueryStringValue("g0.step_input", "") as string,
   yaxis: {
-    limits: {enable: false, range: [0, 0]}
-  }
+    limits: { enable: false, range: { "1": [0, 0] } }
+  },
+  isHistogram: false,
+  isEmptyHistogram: false,
+  spanGaps: false,
 };
 
 export function reducer(state: GraphState, action: GraphAction): GraphState {
@@ -32,6 +51,11 @@ export function reducer(state: GraphState, action: GraphAction): GraphState {
           }
         }
       };
+    case "SET_CUSTOM_STEP":
+      return {
+        ...state,
+        customStep: action.payload
+      };
     case "SET_YAXIS_LIMITS":
       return {
         ...state,
@@ -42,6 +66,21 @@ export function reducer(state: GraphState, action: GraphAction): GraphState {
             range: action.payload
           }
         }
+      };
+    case "SET_IS_HISTOGRAM":
+      return {
+        ...state,
+        isHistogram: action.payload
+      };
+    case "SET_IS_EMPTY_HISTOGRAM":
+      return {
+        ...state,
+        isEmptyHistogram: action.payload
+      };
+    case "SET_SPAN_GAPS":
+      return {
+        ...state,
+        spanGaps: action.payload
       };
     default:
       throw new Error();

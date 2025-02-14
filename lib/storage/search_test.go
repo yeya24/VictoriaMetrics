@@ -72,10 +72,7 @@ func TestSearchQueryMarshalUnmarshal(t *testing.T) {
 
 func TestSearch(t *testing.T) {
 	path := "TestSearch"
-	st, err := OpenStorage(path, 0, 0, 0)
-	if err != nil {
-		t.Fatalf("cannot open storage %q: %s", path, err)
-	}
+	st := MustOpenStorage(path, OpenOptions{})
 	defer func() {
 		st.MustClose()
 		if err := os.RemoveAll(path); err != nil {
@@ -87,7 +84,6 @@ func TestSearch(t *testing.T) {
 	const rowsCount = 2e4
 	const rowsPerBlock = 1e3
 	const metricGroupsCount = rowsCount / 5
-	const accountsCount = 2
 
 	mrs := make([]MetricRow, rowsCount)
 	var mn MetricName
@@ -108,23 +104,16 @@ func TestSearch(t *testing.T) {
 
 		blockRowsCount++
 		if blockRowsCount == rowsPerBlock {
-			if err := st.AddRows(mrs[i-blockRowsCount+1:i+1], defaultPrecisionBits); err != nil {
-				t.Fatalf("cannot add rows %d-%d: %s", i-blockRowsCount+1, i+1, err)
-			}
+			st.AddRows(mrs[i-blockRowsCount+1:i+1], defaultPrecisionBits)
 			blockRowsCount = 0
 		}
 	}
-	if err := st.AddRows(mrs[rowsCount-blockRowsCount:], defaultPrecisionBits); err != nil {
-		t.Fatalf("cannot add rows %v-%v: %s", rowsCount-blockRowsCount, rowsCount, err)
-	}
+	st.AddRows(mrs[rowsCount-blockRowsCount:], defaultPrecisionBits)
 	endTimestamp := mrs[len(mrs)-1].Timestamp
 
 	// Re-open the storage in order to flush all the pending cached data.
 	st.MustClose()
-	st, err = OpenStorage(path, 0, 0, 0)
-	if err != nil {
-		t.Fatalf("cannot re-open storage %q: %s", path, err)
-	}
+	st = MustOpenStorage(path, OpenOptions{})
 
 	// Run search.
 	tr := TimeRange{
@@ -133,7 +122,7 @@ func TestSearch(t *testing.T) {
 	}
 
 	t.Run("serial", func(t *testing.T) {
-		if err := testSearchInternal(st, tr, mrs, accountsCount); err != nil {
+		if err := testSearchInternal(st, tr, mrs); err != nil {
 			t.Fatalf("unexpected error: %s", err)
 		}
 	})
@@ -142,7 +131,7 @@ func TestSearch(t *testing.T) {
 		ch := make(chan error, 3)
 		for i := 0; i < cap(ch); i++ {
 			go func() {
-				ch <- testSearchInternal(st, tr, mrs, accountsCount)
+				ch <- testSearchInternal(st, tr, mrs)
 			}()
 		}
 		var firstError error
@@ -162,8 +151,7 @@ func TestSearch(t *testing.T) {
 	})
 }
 
-func testSearchInternal(st *Storage, tr TimeRange, mrs []MetricRow, accountsCount int) error {
-	var s Search
+func testSearchInternal(s *Storage, tr TimeRange, mrs []MetricRow) error {
 	for i := 0; i < 10; i++ {
 		// Prepare TagFilters for search.
 		tfs := NewTagFilters()
@@ -196,74 +184,75 @@ func testSearchInternal(st *Storage, tr TimeRange, mrs []MetricRow, accountsCoun
 			expectedMrs = append(expectedMrs, *mr)
 		}
 
-		type metricBlock struct {
-			MetricName []byte
-			Block      *Block
-		}
-
-		// Search
-		s.Init(st, []*TagFilters{tfs}, tr, 1e5, noDeadline)
-		var mbs []metricBlock
-		for s.NextMetricBlock() {
-			var b Block
-			s.MetricBlockRef.BlockRef.MustReadBlock(&b, true)
-
-			var mb metricBlock
-			mb.MetricName = append(mb.MetricName, s.MetricBlockRef.MetricName...)
-			mb.Block = &b
-			mbs = append(mbs, mb)
-		}
-		if err := s.Error(); err != nil {
-			return fmt.Errorf("search error: %w", err)
-		}
-		s.MustClose()
-
-		// Build foundMrs.
-		var foundMrs []MetricRow
-		for _, mb := range mbs {
-			rb := newTestRawBlock(mb.Block, tr)
-			if err := mn.Unmarshal(mb.MetricName); err != nil {
-				return fmt.Errorf("cannot unmarshal MetricName: %w", err)
-			}
-			metricNameRaw := mn.marshalRaw(nil)
-			for i, timestamp := range rb.Timestamps {
-				mr := MetricRow{
-					MetricNameRaw: metricNameRaw,
-					Timestamp:     timestamp,
-					Value:         rb.Values[i],
-				}
-				foundMrs = append(foundMrs, mr)
-			}
-		}
-
-		// Compare expectedMrs to foundMrs.
-		sort.Slice(expectedMrs, func(i, j int) bool {
-			a, b := &expectedMrs[i], &expectedMrs[j]
-			cmp := bytes.Compare(a.MetricNameRaw, b.MetricNameRaw)
-			if cmp < 0 {
-				return true
-			}
-			if cmp > 0 {
-				return false
-			}
-			return a.Timestamp < b.Timestamp
-		})
-		sort.Slice(foundMrs, func(i, j int) bool {
-			a, b := &foundMrs[i], &foundMrs[j]
-			cmp := bytes.Compare(a.MetricNameRaw, b.MetricNameRaw)
-			if cmp < 0 {
-				return true
-			}
-			if cmp > 0 {
-				return false
-			}
-			return a.Timestamp < b.Timestamp
-		})
-		if !reflect.DeepEqual(expectedMrs, foundMrs) {
-			return fmt.Errorf("unexpected rows found;\ngot\n%s\nwant\n%s", mrsToString(foundMrs), mrsToString(expectedMrs))
+		if err := testAssertSearchResult(s, tr, tfs, expectedMrs); err != nil {
+			return err
 		}
 	}
 	return nil
+}
+
+func testAssertSearchResult(st *Storage, tr TimeRange, tfs *TagFilters, want []MetricRow) error {
+	type metricBlock struct {
+		MetricName []byte
+		Block      *Block
+	}
+
+	var s Search
+	s.Init(nil, st, []*TagFilters{tfs}, tr, 1e5, noDeadline)
+	var mbs []metricBlock
+	for s.NextMetricBlock() {
+		var b Block
+		s.MetricBlockRef.BlockRef.MustReadBlock(&b)
+
+		var mb metricBlock
+		mb.MetricName = append(mb.MetricName, s.MetricBlockRef.MetricName...)
+		mb.Block = &b
+		mbs = append(mbs, mb)
+	}
+	if err := s.Error(); err != nil {
+		return fmt.Errorf("search error: %w", err)
+	}
+	s.MustClose()
+
+	var got []MetricRow
+	var mn MetricName
+	for _, mb := range mbs {
+		rb := newTestRawBlock(mb.Block, tr)
+		if err := mn.Unmarshal(mb.MetricName); err != nil {
+			return fmt.Errorf("cannot unmarshal MetricName: %w", err)
+		}
+		metricNameRaw := mn.marshalRaw(nil)
+		for i, timestamp := range rb.Timestamps {
+			mr := MetricRow{
+				MetricNameRaw: metricNameRaw,
+				Timestamp:     timestamp,
+				Value:         rb.Values[i],
+			}
+			got = append(got, mr)
+		}
+	}
+
+	testSortMetricRows(got)
+	testSortMetricRows(want)
+	if !reflect.DeepEqual(got, want) {
+		return fmt.Errorf("unexpected rows found;\ngot\n%s\nwant\n%s", mrsToString(got), mrsToString(want))
+	}
+
+	return nil
+}
+
+func testSortMetricRows(mrs []MetricRow) {
+	sort.Slice(mrs, func(i, j int) bool {
+		a, b := &mrs[i], &mrs[j]
+		cmp := bytes.Compare(a.MetricNameRaw, b.MetricNameRaw)
+		if cmp < 0 {
+			return true
+		}
+		if cmp > 0 {
+			return false
+		}
+		return a.Timestamp < b.Timestamp
+	})
 }
 
 func mrsToString(mrs []MetricRow) string {

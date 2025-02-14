@@ -3,12 +3,15 @@ package storage
 import (
 	"fmt"
 	"io"
+	"strings"
 
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/bytesutil"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/encoding"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/fasttime"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/logger"
-	"github.com/VictoriaMetrics/VictoriaMetrics/lib/storagepacelimiter"
+	"github.com/VictoriaMetrics/VictoriaMetrics/lib/querytracer"
+	"github.com/VictoriaMetrics/VictoriaMetrics/lib/slicesutil"
+	"github.com/VictoriaMetrics/VictoriaMetrics/lib/stringsutil"
 )
 
 // BlockRef references a Block.
@@ -66,19 +69,14 @@ type PartRef struct {
 }
 
 // MustReadBlock reads block from br to dst.
-//
-// if fetchData is false, then only block header is read, otherwise all the data is read.
-func (br *BlockRef) MustReadBlock(dst *Block, fetchData bool) {
+func (br *BlockRef) MustReadBlock(dst *Block) {
 	dst.Reset()
 	dst.bh = br.bh
-	if !fetchData {
-		return
-	}
 
-	dst.timestampsData = bytesutil.Resize(dst.timestampsData[:0], int(br.bh.TimestampsBlockSize))
+	dst.timestampsData = bytesutil.ResizeNoCopyMayOverallocate(dst.timestampsData, int(br.bh.TimestampsBlockSize))
 	br.p.timestampsFile.MustReadAt(dst.timestampsData, int64(br.bh.TimestampsBlockOffset))
 
-	dst.valuesData = bytesutil.Resize(dst.valuesData[:0], int(br.bh.ValuesBlockSize))
+	dst.valuesData = bytesutil.ResizeNoCopyMayOverallocate(dst.valuesData, int(br.bh.ValuesBlockSize))
 	br.p.valuesFile.MustReadAt(dst.valuesData, int64(br.bh.ValuesBlockOffset))
 }
 
@@ -96,11 +94,15 @@ type Search struct {
 	// MetricBlockRef is updated with each Search.NextMetricBlock call.
 	MetricBlockRef MetricBlockRef
 
+	// idb is used for MetricName lookup for the found data blocks.
 	idb *indexDB
+
+	// retentionDeadline is used for filtering out blocks outside the configured retention.
+	retentionDeadline int64
 
 	ts tableSearch
 
-	// tr contains time range used in the serach.
+	// tr contains time range used in the search.
 	tr TimeRange
 
 	// tfss contains tag filters used in the search.
@@ -123,6 +125,7 @@ func (s *Search) reset() {
 	s.MetricBlockRef.BlockRef = nil
 
 	s.idb = nil
+	s.retentionDeadline = 0
 	s.ts.reset()
 	s.tr = TimeRange{}
 	s.tfss = nil
@@ -138,32 +141,43 @@ func (s *Search) reset() {
 // MustClose must be called when the search is done.
 //
 // Init returns the upper bound on the number of found time series.
-func (s *Search) Init(storage *Storage, tfss []*TagFilters, tr TimeRange, maxMetrics int, deadline uint64) int {
+func (s *Search) Init(qt *querytracer.Tracer, storage *Storage, tfss []*TagFilters, tr TimeRange, maxMetrics int, deadline uint64) int {
+	qt = qt.NewChild("init series search: filters=%s, timeRange=%s", tfss, &tr)
+	defer qt.Done()
+
+	indexTR := storage.adjustTimeRange(tr)
+	dataTR := tr
+
 	if s.needClosing {
 		logger.Panicf("BUG: missing MustClose call before the next call to Init")
 	}
+	retentionDeadline := int64(fasttime.UnixTimestamp()*1e3) - storage.retentionMsecs
 
 	s.reset()
+	s.idb = storage.idb()
+	s.retentionDeadline = retentionDeadline
 	s.tr = tr
 	s.tfss = tfss
 	s.deadline = deadline
 	s.needClosing = true
 
-	tsids, err := storage.searchTSIDs(tfss, tr, maxMetrics, deadline)
+	var tsids []TSID
+	metricIDs, err := s.idb.searchMetricIDs(qt, tfss, indexTR, maxMetrics, deadline)
 	if err == nil {
-		err = storage.prefetchMetricNames(tsids, deadline)
+		tsids, err = s.idb.getTSIDsFromMetricIDs(qt, metricIDs, deadline)
+		if err == nil {
+			err = storage.prefetchMetricNames(qt, metricIDs, deadline)
+		}
 	}
-	// It is ok to call Init on error from storage.searchTSIDs.
+	// It is ok to call Init on non-nil err.
 	// Init must be called before returning because it will fail
-	// on Seach.MustClose otherwise.
-	s.ts.Init(storage.tb, tsids, tr)
-
+	// on Search.MustClose otherwise.
+	s.ts.Init(storage.tb, tsids, dataTR)
+	qt.Printf("search for parts with data for %d series", len(tsids))
 	if err != nil {
 		s.err = err
 		return 0
 	}
-
-	s.idb = storage.idb()
 	return len(tsids)
 }
 
@@ -199,16 +213,16 @@ func (s *Search) NextMetricBlock() bool {
 		s.loops++
 		tsid := &s.ts.BlockRef.bh.TSID
 		if tsid.MetricID != s.prevMetricID {
-			var err error
-			s.MetricBlockRef.MetricName, err = s.idb.searchMetricNameWithCache(s.MetricBlockRef.MetricName[:0], tsid.MetricID)
-			if err != nil {
-				if err == io.EOF {
-					// Skip missing metricName for tsid.MetricID.
-					// It should be automatically fixed. See indexDB.searchMetricNameWithCache for details.
-					continue
-				}
-				s.err = err
-				return false
+			if s.ts.BlockRef.bh.MaxTimestamp < s.retentionDeadline {
+				// Skip the block, since it contains only data outside the configured retention.
+				continue
+			}
+			var ok bool
+			s.MetricBlockRef.MetricName, ok = s.idb.searchMetricName(s.MetricBlockRef.MetricName[:0], tsid.MetricID, false)
+			if !ok {
+				// Skip missing metricName for tsid.MetricID.
+				// It should be automatically fixed. See indexDB.searchMetricNameWithCache for details.
+				continue
 			}
 			s.prevMetricID = tsid.MetricID
 		}
@@ -226,17 +240,39 @@ func (s *Search) NextMetricBlock() bool {
 
 // SearchQuery is used for sending search queries from vmselect to vmstorage.
 type SearchQuery struct {
+	// The time range for searching time series
 	MinTimestamp int64
 	MaxTimestamp int64
-	TagFilterss  [][]TagFilter
+
+	// Tag filters for the search query
+	TagFilterss [][]TagFilter
+
+	// The maximum number of time series the search query can return.
+	MaxMetrics int
+}
+
+// GetTimeRange returns time range for the given sq.
+func (sq *SearchQuery) GetTimeRange() TimeRange {
+	return TimeRange{
+		MinTimestamp: sq.MinTimestamp,
+		MaxTimestamp: sq.MaxTimestamp,
+	}
 }
 
 // NewSearchQuery creates new search query for the given args.
-func NewSearchQuery(start, end int64, tagFilterss [][]TagFilter) *SearchQuery {
+func NewSearchQuery(start, end int64, tagFilterss [][]TagFilter, maxMetrics int) *SearchQuery {
+	if start < 0 {
+		// This is needed for https://github.com/VictoriaMetrics/VictoriaMetrics/issues/5553
+		start = 0
+	}
+	if maxMetrics <= 0 {
+		maxMetrics = 2e9
+	}
 	return &SearchQuery{
 		MinTimestamp: start,
 		MaxTimestamp: end,
 		TagFilterss:  tagFilterss,
+		MaxMetrics:   maxMetrics,
 	}
 }
 
@@ -250,9 +286,25 @@ type TagFilter struct {
 
 // String returns string representation of tf.
 func (tf *TagFilter) String() string {
-	var bb bytesutil.ByteBuffer
-	fmt.Fprintf(&bb, "{Key=%q, Value=%q, IsNegative: %v, IsRegexp: %v}", tf.Key, tf.Value, tf.IsNegative, tf.IsRegexp)
-	return string(bb.B)
+	op := tf.getOp()
+	value := stringsutil.LimitStringLen(string(tf.Value), 60)
+	if len(tf.Key) == 0 {
+		return fmt.Sprintf("__name__%s%q", op, value)
+	}
+	return fmt.Sprintf("%s%s%q", tf.Key, op, value)
+}
+
+func (tf *TagFilter) getOp() string {
+	if tf.IsNegative {
+		if tf.IsRegexp {
+			return "!~"
+		}
+		return "!="
+	}
+	if tf.IsRegexp {
+		return "=~"
+	}
+	return "="
 }
 
 // Marshal appends marshaled tf to dst and returns the result.
@@ -274,19 +326,19 @@ func (tf *TagFilter) Marshal(dst []byte) []byte {
 
 // Unmarshal unmarshals tf from src and returns the tail.
 func (tf *TagFilter) Unmarshal(src []byte) ([]byte, error) {
-	tail, k, err := encoding.UnmarshalBytes(src)
-	if err != nil {
-		return tail, fmt.Errorf("cannot unmarshal Key: %w", err)
+	k, nSize := encoding.UnmarshalBytes(src)
+	if nSize <= 0 {
+		return src, fmt.Errorf("cannot unmarshal Key")
 	}
+	src = src[nSize:]
 	tf.Key = append(tf.Key[:0], k...)
-	src = tail
 
-	tail, v, err := encoding.UnmarshalBytes(src)
-	if err != nil {
-		return tail, fmt.Errorf("cannot unmarshal Value: %w", err)
+	v, nSize := encoding.UnmarshalBytes(src)
+	if nSize <= 0 {
+		return src, fmt.Errorf("cannot unmarshal Value")
 	}
+	src = src[nSize:]
 	tf.Value = append(tf.Value[:0], v...)
-	src = tail
 
 	if len(src) < 1 {
 		return src, fmt.Errorf("cannot unmarshal IsNegative+IsRegexp from empty src")
@@ -315,17 +367,21 @@ func (tf *TagFilter) Unmarshal(src []byte) ([]byte, error) {
 
 // String returns string representation of the search query.
 func (sq *SearchQuery) String() string {
-	var bb bytesutil.ByteBuffer
-	fmt.Fprintf(&bb, "MinTimestamp=%s, MaxTimestamp=%s, TagFilters=[\n",
-		timestampToTime(sq.MinTimestamp), timestampToTime(sq.MaxTimestamp))
-	for _, tagFilters := range sq.TagFilterss {
-		for _, tf := range tagFilters {
-			fmt.Fprintf(&bb, "%s", tf.String())
-		}
-		fmt.Fprintf(&bb, "\n")
+	a := make([]string, len(sq.TagFilterss))
+	for i, tfs := range sq.TagFilterss {
+		a[i] = tagFiltersToString(tfs)
 	}
-	fmt.Fprintf(&bb, "]")
-	return string(bb.B)
+	start := TimestampToHumanReadableFormat(sq.MinTimestamp)
+	end := TimestampToHumanReadableFormat(sq.MaxTimestamp)
+	return fmt.Sprintf("filters=%s, timeRange=[%s..%s]", a, start, end)
+}
+
+func tagFiltersToString(tfs []TagFilter) string {
+	a := make([]string, len(tfs))
+	for i, tf := range tfs {
+		a[i] = tf.String()
+	}
+	return "{" + strings.Join(a, ",") + "}"
 }
 
 // Marshal appends marshaled sq to dst and returns the result.
@@ -344,42 +400,36 @@ func (sq *SearchQuery) Marshal(dst []byte) []byte {
 
 // Unmarshal unmarshals sq from src and returns the tail.
 func (sq *SearchQuery) Unmarshal(src []byte) ([]byte, error) {
-	tail, minTs, err := encoding.UnmarshalVarInt64(src)
-	if err != nil {
-		return src, fmt.Errorf("cannot unmarshal MinTimestamp: %w", err)
+	minTs, nSize := encoding.UnmarshalVarInt64(src)
+	if nSize <= 0 {
+		return src, fmt.Errorf("cannot unmarshal MinTimestamp from varint")
 	}
+	src = src[nSize:]
 	sq.MinTimestamp = minTs
-	src = tail
 
-	tail, maxTs, err := encoding.UnmarshalVarInt64(src)
-	if err != nil {
-		return src, fmt.Errorf("cannot unmarshal MaxTimestamp: %w", err)
+	maxTs, nSize := encoding.UnmarshalVarInt64(src)
+	if nSize <= 0 {
+		return src, fmt.Errorf("cannot unmarshal MaxTimestamp from varint")
 	}
+	src = src[nSize:]
 	sq.MaxTimestamp = maxTs
-	src = tail
 
-	tail, tfssCount, err := encoding.UnmarshalVarUint64(src)
-	if err != nil {
-		return src, fmt.Errorf("cannot unmarshal the count of TagFilterss: %w", err)
+	tfssCount, nSize := encoding.UnmarshalVarUint64(src)
+	if nSize <= 0 {
+		return src, fmt.Errorf("cannot unmarshal the count of TagFilterss from uvarint")
 	}
-	if n := int(tfssCount) - cap(sq.TagFilterss); n > 0 {
-		sq.TagFilterss = append(sq.TagFilterss[:cap(sq.TagFilterss)], make([][]TagFilter, n)...)
-	}
-	sq.TagFilterss = sq.TagFilterss[:tfssCount]
-	src = tail
+	src = src[nSize:]
+	sq.TagFilterss = slicesutil.SetLength(sq.TagFilterss, int(tfssCount))
 
 	for i := 0; i < int(tfssCount); i++ {
-		tail, tfsCount, err := encoding.UnmarshalVarUint64(src)
-		if err != nil {
-			return src, fmt.Errorf("cannot unmarshal the count of TagFilters: %w", err)
+		tfsCount, nSize := encoding.UnmarshalVarUint64(src)
+		if nSize <= 0 {
+			return src, fmt.Errorf("cannot unmarshal the count of TagFilters from uvarint")
 		}
-		src = tail
+		src = src[nSize:]
 
 		tagFilters := sq.TagFilterss[i]
-		if n := int(tfsCount) - cap(tagFilters); n > 0 {
-			tagFilters = append(tagFilters[:cap(tagFilters)], make([]TagFilter, n)...)
-		}
-		tagFilters = tagFilters[:tfsCount]
+		tagFilters = slicesutil.SetLength(tagFilters, int(tfsCount))
 		for j := 0; j < int(tfsCount); j++ {
 			tail, err := tagFilters[j].Unmarshal(src)
 			if err != nil {
@@ -397,7 +447,6 @@ func checkSearchDeadlineAndPace(deadline uint64) error {
 	if fasttime.UnixTimestamp() > deadline {
 		return ErrDeadlineExceeded
 	}
-	storagepacelimiter.Search.WaitIfNeeded()
 	return nil
 }
 

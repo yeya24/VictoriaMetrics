@@ -9,15 +9,16 @@ import (
 	"github.com/VictoriaMetrics/VictoriaMetrics/app/vmalert/datasource"
 	"github.com/VictoriaMetrics/VictoriaMetrics/app/vmalert/notifier"
 	"github.com/VictoriaMetrics/VictoriaMetrics/app/vmalert/remotewrite"
+	"github.com/VictoriaMetrics/VictoriaMetrics/app/vmalert/rule"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/logger"
 )
 
 // manager controls group states
 type manager struct {
 	querierBuilder datasource.QuerierBuilder
-	notifiers      []notifier.Notifier
+	notifiers      func() []notifier.Notifier
 
-	rw *remotewrite.Client
+	rw remotewrite.RWClient
 	// remote read builder.
 	rr datasource.QuerierBuilder
 
@@ -25,28 +26,45 @@ type manager struct {
 	labels map[string]string
 
 	groupsMu sync.RWMutex
-	groups   map[uint64]*Group
+	groups   map[uint64]*rule.Group
 }
 
-// AlertAPI generates APIAlert object from alert by its ID(hash)
-func (m *manager) AlertAPI(gID, aID uint64) (*APIAlert, error) {
+// ruleAPI generates apiRule object from alert by its ID(hash)
+func (m *manager) ruleAPI(gID, rID uint64) (apiRule, error) {
 	m.groupsMu.RLock()
 	defer m.groupsMu.RUnlock()
 
 	g, ok := m.groups[gID]
 	if !ok {
-		return nil, fmt.Errorf("can't find group with id %q", gID)
+		return apiRule{}, fmt.Errorf("can't find group with id %d", gID)
 	}
 	for _, rule := range g.Rules {
-		ar, ok := rule.(*AlertingRule)
+		if rule.ID() == rID {
+			return ruleToAPI(rule), nil
+		}
+	}
+	return apiRule{}, fmt.Errorf("can't find rule with id %d in group %q", rID, g.Name)
+}
+
+// alertAPI generates apiAlert object from alert by its ID(hash)
+func (m *manager) alertAPI(gID, aID uint64) (*apiAlert, error) {
+	m.groupsMu.RLock()
+	defer m.groupsMu.RUnlock()
+
+	g, ok := m.groups[gID]
+	if !ok {
+		return nil, fmt.Errorf("can't find group with id %d", gID)
+	}
+	for _, r := range g.Rules {
+		ar, ok := r.(*rule.AlertingRule)
 		if !ok {
 			continue
 		}
-		if apiAlert := ar.AlertAPI(aID); apiAlert != nil {
+		if apiAlert := alertToAPI(ar, aID); apiAlert != nil {
 			return apiAlert, nil
 		}
 	}
-	return nil, fmt.Errorf("can't find alert with id %q in group %q", aID, g.Name)
+	return nil, fmt.Errorf("can't find alert with id %d in group %q", aID, g.Name)
 }
 
 func (m *manager) start(ctx context.Context, groupsCfg []config.Group) error {
@@ -63,30 +81,24 @@ func (m *manager) close() {
 	m.wg.Wait()
 }
 
-func (m *manager) startGroup(ctx context.Context, group *Group, restore bool) error {
-	if restore && m.rr != nil {
-		err := group.Restore(ctx, m.rr, *remoteReadLookBack, m.labels)
-		if err != nil {
-			if !*remoteReadIgnoreRestoreErrors {
-				return fmt.Errorf("failed to restore state for group %q: %w", group.Name, err)
-			}
-			logger.Errorf("error while restoring state for group %q: %s", group.Name, err)
-		}
-	}
-
+func (m *manager) startGroup(ctx context.Context, g *rule.Group, restore bool) error {
 	m.wg.Add(1)
-	id := group.ID()
+	id := g.ID()
 	go func() {
-		group.start(ctx, m.notifiers, m.rw)
-		m.wg.Done()
+		defer m.wg.Done()
+		if restore {
+			g.Start(ctx, m.notifiers, m.rw, m.rr)
+		} else {
+			g.Start(ctx, m.notifiers, m.rw, nil)
+		}
 	}()
-	m.groups[id] = group
+	m.groups[id] = g
 	return nil
 }
 
 func (m *manager) update(ctx context.Context, groupsCfg []config.Group, restore bool) error {
 	var rrPresent, arPresent bool
-	groupsRegistry := make(map[uint64]*Group)
+	groupsRegistry := make(map[uint64]*rule.Group)
 	for _, cfg := range groupsCfg {
 		for _, r := range cfg.Rules {
 			if rrPresent && arPresent {
@@ -99,7 +111,7 @@ func (m *manager) update(ctx context.Context, groupsCfg []config.Group, restore 
 				arPresent = true
 			}
 		}
-		ng := newGroup(cfg, m.querierBuilder, *evaluationInterval, m.labels)
+		ng := rule.NewGroup(cfg, m.querierBuilder, *evaluationInterval, m.labels)
 		groupsRegistry[ng.ID()] = ng
 	}
 
@@ -107,12 +119,12 @@ func (m *manager) update(ctx context.Context, groupsCfg []config.Group, restore 
 		return fmt.Errorf("config contains recording rules but `-remoteWrite.url` isn't set")
 	}
 	if arPresent && m.notifiers == nil {
-		return fmt.Errorf("config contains alerting rules but `-notifier.url` isn't set")
+		return fmt.Errorf("config contains alerting rules but neither `-notifier.url` nor `-notifier.config` nor `-notifier.blackhole` aren't set")
 	}
 
 	type updateItem struct {
-		old *Group
-		new *Group
+		old *rule.Group
+		new *rule.Group
 	}
 	var toUpdate []updateItem
 
@@ -122,7 +134,7 @@ func (m *manager) update(ctx context.Context, groupsCfg []config.Group, restore 
 		if !ok {
 			// old group is not present in new list,
 			// so must be stopped and deleted
-			og.close()
+			og.Close()
 			delete(m.groups, og.ID())
 			og = nil
 			continue
@@ -134,6 +146,7 @@ func (m *manager) update(ctx context.Context, groupsCfg []config.Group, restore 
 	}
 	for _, ng := range groupsRegistry {
 		if err := m.startGroup(ctx, ng, restore); err != nil {
+			m.groupsMu.Unlock()
 			return err
 		}
 	}
@@ -143,39 +156,16 @@ func (m *manager) update(ctx context.Context, groupsCfg []config.Group, restore 
 		var wg sync.WaitGroup
 		for _, item := range toUpdate {
 			wg.Add(1)
-			go func(old *Group, new *Group) {
-				old.updateCh <- new
+			// cancel evaluation so the Update will be applied as fast as possible.
+			// it is important to call InterruptEval before the update, because cancel fn
+			// can be re-assigned during the update.
+			item.old.InterruptEval()
+			go func(oldGroup *rule.Group, newGroup *rule.Group) {
+				oldGroup.UpdateWith(newGroup)
 				wg.Done()
 			}(item.old, item.new)
 		}
 		wg.Wait()
 	}
 	return nil
-}
-
-func (g *Group) toAPI() APIGroup {
-	g.mu.RLock()
-	defer g.mu.RUnlock()
-
-	ag := APIGroup{
-		// encode as string to avoid rounding
-		ID: fmt.Sprintf("%d", g.ID()),
-
-		Name:              g.Name,
-		Type:              g.Type.String(),
-		File:              g.File,
-		Interval:          g.Interval.String(),
-		Concurrency:       g.Concurrency,
-		ExtraFilterLabels: g.ExtraFilterLabels,
-		Labels:            g.Labels,
-	}
-	for _, r := range g.Rules {
-		switch v := r.(type) {
-		case *AlertingRule:
-			ag.AlertingRules = append(ag.AlertingRules, v.RuleAPI())
-		case *RecordingRule:
-			ag.RecordingRules = append(ag.RecordingRules, v.RuleAPI())
-		}
-	}
-	return ag
 }

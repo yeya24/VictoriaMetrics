@@ -45,7 +45,7 @@ type cWriter struct {
 	err error
 }
 
-func (cw *cWriter) printf(format string, args ...interface{}) {
+func (cw *cWriter) printf(format string, args ...any) {
 	if cw.err != nil {
 		return
 	}
@@ -54,7 +54,7 @@ func (cw *cWriter) printf(format string, args ...interface{}) {
 	cw.err = err
 }
 
-//"{"metric":{"__name__":"cpu_usage_guest","arch":"x64","hostname":"host_19",},"timestamps":[1567296000000,1567296010000],"values":[1567296000000,66]}
+// "{"metric":{"__name__":"cpu_usage_guest","arch":"x64","hostname":"host_19",},"timestamps":[1567296000000,1567296010000],"values":[1567296000000,66]}
 func (ts *TimeSeries) write(w io.Writer) (int, error) {
 	timestamps := ts.Timestamps
 	values := ts.Values

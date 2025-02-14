@@ -6,6 +6,7 @@ import (
 	"io"
 
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/promscrape/discoveryutils"
+	"github.com/VictoriaMetrics/VictoriaMetrics/lib/promutils"
 )
 
 // getNodesLabels returns labels for k8s nodes obtained from the given cfg
@@ -36,7 +37,7 @@ func parseNode(data []byte) (object, error) {
 
 // NodeList represents NodeList from k8s API.
 //
-// See https://kubernetes.io/docs/reference/generated/kubernetes-api/v1.17/#nodelist-v1-core
+// See https://kubernetes.io/docs/reference/kubernetes-api/cluster-resources/node-v1/#NodeList
 type NodeList struct {
 	Metadata ListMeta
 	Items    []*Node
@@ -44,18 +45,26 @@ type NodeList struct {
 
 // Node represents Node from k8s API.
 //
-// See https://kubernetes.io/docs/reference/generated/kubernetes-api/v1.17/#node-v1-core
+// See https://kubernetes.io/docs/reference/kubernetes-api/cluster-resources/node-v1/
 type Node struct {
 	Metadata ObjectMeta
 	Status   NodeStatus
+	Spec     NodeSpec
 }
 
 // NodeStatus represents NodeStatus from k8s API.
 //
-// See https://kubernetes.io/docs/reference/generated/kubernetes-api/v1.17/#nodestatus-v1-core
+// See https://kubernetes.io/docs/reference/kubernetes-api/cluster-resources/node-v1/#NodeStatus
 type NodeStatus struct {
 	Addresses       []NodeAddress
 	DaemonEndpoints NodeDaemonEndpoints
+}
+
+// NodeSpec represents NodeSpec from k8s API.
+//
+// See https://kubernetes.io/docs/reference/kubernetes-api/cluster-resources/node-v1/#NodeSpec
+type NodeSpec struct {
+	ProviderID string
 }
 
 // NodeAddress represents NodeAddress from k8s API.
@@ -73,21 +82,21 @@ type NodeDaemonEndpoints struct {
 	KubeletEndpoint DaemonEndpoint
 }
 
-// getTargetLabels returs labels for the given n.
+// getTargetLabels returns labels for the given n.
 //
 // See https://prometheus.io/docs/prometheus/latest/configuration/configuration/#node
-func (n *Node) getTargetLabels(gw *groupWatcher) []map[string]string {
+func (n *Node) getTargetLabels(_ *groupWatcher) []*promutils.Labels {
 	addr := getNodeAddr(n.Status.Addresses)
 	if len(addr) == 0 {
 		// Skip node without address
 		return nil
 	}
 	addr = discoveryutils.JoinHostPort(addr, n.Status.DaemonEndpoints.KubeletEndpoint.Port)
-	m := map[string]string{
-		"__address__":                 addr,
-		"instance":                    n.Metadata.Name,
-		"__meta_kubernetes_node_name": n.Metadata.Name,
-	}
+	m := promutils.GetLabels()
+	m.Add("__address__", addr)
+	m.Add("instance", n.Metadata.Name)
+	m.Add("__meta_kubernetes_node_name", n.Metadata.Name)
+	m.Add("__meta_kubernetes_node_provider_id", n.Spec.ProviderID)
 	n.Metadata.registerLabelsAndAnnotations("__meta_kubernetes_node", m)
 	addrTypesUsed := make(map[string]bool, len(n.Status.Addresses))
 	for _, a := range n.Status.Addresses {
@@ -95,10 +104,9 @@ func (n *Node) getTargetLabels(gw *groupWatcher) []map[string]string {
 			continue
 		}
 		addrTypesUsed[a.Type] = true
-		ln := discoveryutils.SanitizeLabelName(a.Type)
-		m["__meta_kubernetes_node_address_"+ln] = a.Address
+		m.Add(discoveryutils.SanitizeLabelName("__meta_kubernetes_node_address_"+a.Type), a.Address)
 	}
-	return []map[string]string{m}
+	return []*promutils.Labels{m}
 }
 
 func getNodeAddr(nas []NodeAddress) string {

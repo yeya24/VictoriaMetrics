@@ -32,8 +32,54 @@ func BenchmarkTagFilterMatchSuffix(b *testing.B) {
 			}
 		})
 	})
+	b.Run("regexp-any-suffix-match-anchored", func(b *testing.B) {
+		key := []byte("^foo.*$")
+		isNegative := false
+		isRegexp := true
+		suffix := marshalTagValue(nil, []byte("ojksdfds"))
+		b.ReportAllocs()
+		b.SetBytes(int64(1))
+		b.RunParallel(func(pb *testing.PB) {
+			var tf tagFilter
+			if err := tf.Init(nil, nil, key, isNegative, isRegexp); err != nil {
+				logger.Panicf("BUG: unexpected error: %s", err)
+			}
+			for pb.Next() {
+				ok, err := tf.matchSuffix(suffix)
+				if err != nil {
+					logger.Panicf("BUG: unexpected error: %s", err)
+				}
+				if !ok {
+					logger.Panicf("BUG: unexpected suffix mismatch")
+				}
+			}
+		})
+	})
 	b.Run("regexp-any-nonzero-suffix-match", func(b *testing.B) {
 		key := []byte("foo.+")
+		isNegative := false
+		isRegexp := true
+		suffix := marshalTagValue(nil, []byte("ojksdfds"))
+		b.ReportAllocs()
+		b.SetBytes(int64(1))
+		b.RunParallel(func(pb *testing.PB) {
+			var tf tagFilter
+			if err := tf.Init(nil, nil, key, isNegative, isRegexp); err != nil {
+				logger.Panicf("BUG: unexpected error: %s", err)
+			}
+			for pb.Next() {
+				ok, err := tf.matchSuffix(suffix)
+				if err != nil {
+					logger.Panicf("BUG: unexpected error: %s", err)
+				}
+				if !ok {
+					logger.Panicf("BUG: unexpected suffix mismatch")
+				}
+			}
+		})
+	})
+	b.Run("regexp-any-nonzero-suffix-match-anchored", func(b *testing.B) {
+		key := []byte("^foo.+$")
 		isNegative := false
 		isRegexp := true
 		suffix := marshalTagValue(nil, []byte("ojksdfds"))
@@ -365,7 +411,7 @@ func BenchmarkOptimizedReMatchCost(b *testing.B) {
 		})
 	})
 	b.Run(".*", func(b *testing.B) {
-		reMatch := func(b []byte) bool {
+		reMatch := func(_ []byte) bool {
 			return true
 		}
 		suffix := []byte("foo1.bar.baz.sss.ddd")

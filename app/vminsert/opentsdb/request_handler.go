@@ -6,7 +6,7 @@ import (
 	"github.com/VictoriaMetrics/VictoriaMetrics/app/vminsert/common"
 	"github.com/VictoriaMetrics/VictoriaMetrics/app/vminsert/relabel"
 	parser "github.com/VictoriaMetrics/VictoriaMetrics/lib/protoparser/opentsdb"
-	"github.com/VictoriaMetrics/VictoriaMetrics/lib/writeconcurrencylimiter"
+	"github.com/VictoriaMetrics/VictoriaMetrics/lib/protoparser/opentsdb/stream"
 	"github.com/VictoriaMetrics/metrics"
 )
 
@@ -19,9 +19,7 @@ var (
 //
 // See http://opentsdb.net/docs/build/html/api_telnet/put.html
 func InsertHandler(r io.Reader) error {
-	return writeconcurrencylimiter.Do(func() error {
-		return parser.ParseStream(r, insertRows)
-	})
+	return stream.Parse(r, insertRows)
 }
 
 func insertRows(rows []parser.Row) error {
@@ -38,14 +36,9 @@ func insertRows(rows []parser.Row) error {
 			tag := &r.Tags[j]
 			ctx.AddLabel(tag.Key, tag.Value)
 		}
-		if hasRelabeling {
-			ctx.ApplyRelabeling()
-		}
-		if len(ctx.Labels) == 0 {
-			// Skip metric without labels.
+		if !ctx.TryPrepareLabels(hasRelabeling) {
 			continue
 		}
-		ctx.SortLabelsIfNeeded()
 		if err := ctx.WriteDataPoint(nil, ctx.Labels, r.Timestamp, r.Value); err != nil {
 			return err
 		}

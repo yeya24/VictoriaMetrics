@@ -4,8 +4,52 @@ import (
 	"fmt"
 	"testing"
 
+	"github.com/VictoriaMetrics/VictoriaMetrics/lib/auth"
+	"github.com/VictoriaMetrics/VictoriaMetrics/lib/bytesutil"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/prompbmarshal"
 )
+
+func BenchmarkIsAutoMetricMiss(b *testing.B) {
+	metrics := []string{
+		"process_cpu_seconds_total",
+		"process_resident_memory_bytes",
+		"vm_tcplistener_read_calls_total",
+		"http_requests_total",
+		"node_cpu_seconds_total",
+	}
+	b.ReportAllocs()
+	b.SetBytes(1)
+	b.RunParallel(func(pb *testing.PB) {
+		for pb.Next() {
+			for _, metric := range metrics {
+				if isAutoMetric(metric) {
+					panic(fmt.Errorf("BUG: %q mustn't be detected as auto metric", metric))
+				}
+			}
+		}
+	})
+}
+
+func BenchmarkIsAutoMetricHit(b *testing.B) {
+	metrics := []string{
+		"up",
+		"scrape_duration_seconds",
+		"scrape_series_current",
+		"scrape_samples_scraped",
+		"scrape_series_added",
+	}
+	b.ReportAllocs()
+	b.SetBytes(1)
+	b.RunParallel(func(pb *testing.PB) {
+		for pb.Next() {
+			for _, metric := range metrics {
+				if !isAutoMetric(metric) {
+					panic(fmt.Errorf("BUG: %q must be detected as auto metric", metric))
+				}
+			}
+		}
+	})
+}
 
 func BenchmarkScrapeWorkScrapeInternal(b *testing.B) {
 	data := `
@@ -30,8 +74,9 @@ vm_tcplistener_read_timeouts_total{name="https", addr=":443"} 12353
 vm_tcplistener_write_calls_total{name="http", addr=":80"} 3996
 vm_tcplistener_write_calls_total{name="https", addr=":443"} 132356
 `
-	readDataFunc := func(dst []byte) ([]byte, error) {
-		return append(dst, data...), nil
+	readDataFunc := func(dst *bytesutil.ByteBuffer) error {
+		dst.B = append(dst.B, data...)
+		return nil
 	}
 	b.ReportAllocs()
 	b.SetBytes(int64(len(data)))
@@ -39,7 +84,8 @@ vm_tcplistener_write_calls_total{name="https", addr=":443"} 132356
 		var sw scrapeWork
 		sw.Config = &ScrapeWork{}
 		sw.ReadData = readDataFunc
-		sw.PushData = func(wr *prompbmarshal.WriteRequest) {}
+		sw.PushData = func(_ *auth.Token, _ *prompbmarshal.WriteRequest) {}
+		tsmGlobal.Register(&sw)
 		timestamp := int64(0)
 		for pb.Next() {
 			if err := sw.scrapeInternal(timestamp, timestamp); err != nil {
@@ -47,5 +93,6 @@ vm_tcplistener_write_calls_total{name="https", addr=":443"} 132356
 			}
 			timestamp++
 		}
+		tsmGlobal.Unregister(&sw)
 	})
 }

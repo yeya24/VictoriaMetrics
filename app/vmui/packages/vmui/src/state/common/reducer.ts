@@ -1,173 +1,70 @@
-/* eslint max-lines: 0 */
-import {DisplayType} from "../../components/Home/Configurator/DisplayTypeSwitch";
-import {TimeParams, TimePeriod} from "../../types";
-import {dateFromSeconds, formatDateToLocal, getDateNowUTC, getDurationFromPeriod, getTimeperiodForDuration} from "../../utils/time";
-import {getFromStorage} from "../../utils/storage";
-import {getDefaultServer} from "../../utils/default-server-url";
-import {getQueryStringValue} from "../../utils/query-string";
-
-export interface TimeState {
-  duration: string;
-  period: TimeParams;
-}
-
-export interface QueryHistory {
-  index: number,
-  values: string[]
-}
+import { getDefaultServer } from "../../utils/default-server-url";
+import { getQueryStringValue } from "../../utils/query-string";
+import { getFromStorage, saveToStorage } from "../../utils/storage";
+import { AppConfig, Theme } from "../../types";
+import { isDarkTheme } from "../../utils/theme";
+import { removeTrailingSlash } from "../../utils/url";
 
 export interface AppState {
   serverUrl: string;
-  displayType: DisplayType;
-  query: string;
-  time: TimeState;
-  queryHistory: QueryHistory,
-  queryControls: {
-    autoRefresh: boolean;
-    autocomplete: boolean,
-    nocache: boolean
-  }
+  tenantId: string;
+  theme: Theme;
+  isDarkTheme: boolean | null;
+  flags: Record<string, string | null>;
+  appConfig: AppConfig
 }
 
 export type Action =
-    | { type: "SET_DISPLAY_TYPE", payload: DisplayType }
-    | { type: "SET_SERVER", payload: string }
-    | { type: "SET_QUERY", payload: string }
-    | { type: "SET_QUERY_HISTORY_INDEX", payload: number }
-    | { type: "SET_QUERY_HISTORY_VALUES", payload: string[] }
-    | { type: "SET_DURATION", payload: string }
-    | { type: "SET_UNTIL", payload: Date }
-    | { type: "SET_PERIOD", payload: TimePeriod }
-    | { type: "RUN_QUERY"}
-    | { type: "RUN_QUERY_TO_NOW"}
-    | { type: "TOGGLE_AUTOREFRESH"}
-    | { type: "TOGGLE_AUTOCOMPLETE"}
-    | { type: "NO_CACHE"}
+  | { type: "SET_SERVER", payload: string }
+  | { type: "SET_THEME", payload: Theme }
+  | { type: "SET_TENANT_ID", payload: string }
+  | { type: "SET_FLAGS", payload: Record<string, string | null> }
+  | { type: "SET_APP_CONFIG", payload: AppConfig }
+  | { type: "SET_DARK_THEME" }
 
-const duration = getQueryStringValue("g0.range_input", "1h") as string;
-const endInput = formatDateToLocal(getQueryStringValue("g0.end_input", getDateNowUTC()) as Date);
-const query = getQueryStringValue("g0.expr", "") as string;
+const tenantId = getQueryStringValue("g0.tenantID", "") as string;
 
 export const initialState: AppState = {
-  serverUrl: getDefaultServer(),
-  displayType: getQueryStringValue("tab", "chart") as DisplayType,
-  query: query, // demo_memory_usage_bytes
-  queryHistory: { index: 0, values: [query] },
-  time: {
-    duration,
-    period: getTimeperiodForDuration(duration, new Date(endInput))
-  },
-  queryControls: {
-    autoRefresh: false,
-    autocomplete: getFromStorage("AUTOCOMPLETE") as boolean || false,
-    nocache: getFromStorage("NO_CACHE") as boolean || false,
-  }
+  serverUrl: removeTrailingSlash(getDefaultServer(tenantId)),
+  tenantId,
+  theme: (getFromStorage("THEME") || Theme.system) as Theme,
+  isDarkTheme: null,
+  flags: {},
+  appConfig: {}
 };
 
 export function reducer(state: AppState, action: Action): AppState {
   switch (action.type) {
-    case "SET_DISPLAY_TYPE":
-      return {
-        ...state,
-        displayType: action.payload
-      };
     case "SET_SERVER":
       return {
         ...state,
-        serverUrl: action.payload
+        serverUrl: removeTrailingSlash(action.payload)
       };
-    case "SET_QUERY":
+    case "SET_TENANT_ID":
       return {
         ...state,
-        query: action.payload
+        tenantId: action.payload
       };
-    case "SET_QUERY_HISTORY_INDEX":
+    case "SET_THEME":
+      saveToStorage("THEME", action.payload);
       return {
         ...state,
-        queryHistory: {
-          ...state.queryHistory,
-          index: action.payload
-        }
+        theme: action.payload,
       };
-    case "SET_QUERY_HISTORY_VALUES":
+    case "SET_DARK_THEME":
       return {
         ...state,
-        queryHistory: {
-          ...state.queryHistory,
-          values: action.payload
-        }
+        isDarkTheme: isDarkTheme(state.theme)
       };
-    case "SET_DURATION":
+    case "SET_FLAGS":
       return {
         ...state,
-        time: {
-          ...state.time,
-          duration: action.payload,
-          period: getTimeperiodForDuration(action.payload, dateFromSeconds(state.time.period.end))
-        }
+        flags: action.payload
       };
-    case "SET_UNTIL":
+    case "SET_APP_CONFIG":
       return {
         ...state,
-        time: {
-          ...state.time,
-          period: getTimeperiodForDuration(state.time.duration, action.payload)
-        }
-      };
-    case "SET_PERIOD":
-      // eslint-disable-next-line no-case-declarations
-      const duration = getDurationFromPeriod(action.payload);
-      return {
-        ...state,
-        queryControls: {
-          ...state.queryControls,
-          autoRefresh: false // since we're considering this to action to be fired from period selection on chart
-        },
-        time: {
-          ...state.time,
-          duration,
-          period: getTimeperiodForDuration(duration, action.payload.to)
-        }
-      };
-    case "TOGGLE_AUTOREFRESH":
-      return {
-        ...state,
-        queryControls: {
-          ...state.queryControls,
-          autoRefresh: !state.queryControls.autoRefresh
-        }
-      };
-    case "TOGGLE_AUTOCOMPLETE":
-      return {
-        ...state,
-        queryControls: {
-          ...state.queryControls,
-          autocomplete: !state.queryControls.autocomplete
-        }
-      };
-    case "NO_CACHE":
-      return {
-        ...state,
-        queryControls: {
-          ...state.queryControls,
-          nocache: !state.queryControls.nocache
-        }
-      };
-    case "RUN_QUERY":
-      return {
-        ...state,
-        time: {
-          ...state.time,
-          period: getTimeperiodForDuration(state.time.duration, dateFromSeconds(state.time.period.end))
-        }
-      };
-    case "RUN_QUERY_TO_NOW":
-      return {
-        ...state,
-        time: {
-          ...state.time,
-          period: getTimeperiodForDuration(state.time.duration)
-        }
+        appConfig: action.payload
       };
     default:
       throw new Error();

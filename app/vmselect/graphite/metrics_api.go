@@ -1,6 +1,7 @@
 package graphite
 
 import (
+	"flag"
 	"fmt"
 	"net/http"
 	"regexp"
@@ -9,22 +10,23 @@ import (
 	"sync"
 	"time"
 
-	"github.com/VictoriaMetrics/VictoriaMetrics/app/vmselect/bufferedwriter"
 	"github.com/VictoriaMetrics/VictoriaMetrics/app/vmselect/netstorage"
 	"github.com/VictoriaMetrics/VictoriaMetrics/app/vmselect/searchutils"
+	"github.com/VictoriaMetrics/VictoriaMetrics/lib/bufferedwriter"
+	"github.com/VictoriaMetrics/VictoriaMetrics/lib/httputils"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/logger"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/storage"
 	"github.com/VictoriaMetrics/metrics"
+	"github.com/VictoriaMetrics/metricsql"
 )
+
+var maxTagValueSuffixes = flag.Int("search.maxTagValueSuffixesPerSearch", 100e3, "The maximum number of tag value suffixes returned from /metrics/find")
 
 // MetricsFindHandler implements /metrics/find handler.
 //
 // See https://graphite-api.readthedocs.io/en/latest/api.html#metrics-find
 func MetricsFindHandler(startTime time.Time, w http.ResponseWriter, r *http.Request) error {
 	deadline := searchutils.GetDeadlineForQuery(r, startTime)
-	if err := r.ParseForm(); err != nil {
-		return fmt.Errorf("cannot parse form values: %w", err)
-	}
 	format := r.FormValue("format")
 	if format == "" {
 		format = "treejson"
@@ -45,7 +47,7 @@ func MetricsFindHandler(startTime time.Time, w http.ResponseWriter, r *http.Requ
 	if len(delimiter) > 1 {
 		return fmt.Errorf("`delimiter` query arg must contain only a single char")
 	}
-	if searchutils.GetBool(r, "automatic_variants") {
+	if httputils.GetBool(r, "automatic_variants") {
 		// See https://github.com/graphite-project/graphite-web/blob/bb9feb0e6815faa73f538af6ed35adea0fb273fd/webapp/graphite/metrics/views.py#L152
 		query = addAutomaticVariants(query, delimiter)
 	}
@@ -56,19 +58,19 @@ func MetricsFindHandler(startTime time.Time, w http.ResponseWriter, r *http.Requ
 			query += "*"
 		}
 	}
-	leavesOnly := searchutils.GetBool(r, "leavesOnly")
-	wildcards := searchutils.GetBool(r, "wildcards")
+	leavesOnly := httputils.GetBool(r, "leavesOnly")
+	wildcards := httputils.GetBool(r, "wildcards")
 	label := r.FormValue("label")
 	if label == "__name__" {
 		label = ""
 	}
 	jsonp := r.FormValue("jsonp")
-	from, err := searchutils.GetTime(r, "from", 0)
+	from, err := httputils.GetTime(r, "from", 0)
 	if err != nil {
 		return err
 	}
 	ct := startTime.UnixNano() / 1e6
-	until, err := searchutils.GetTime(r, "until", ct)
+	until, err := httputils.GetTime(r, "until", ct)
 	if err != nil {
 		return err
 	}
@@ -83,7 +85,7 @@ func MetricsFindHandler(startTime time.Time, w http.ResponseWriter, r *http.Requ
 	if leavesOnly {
 		paths = filterLeaves(paths, delimiter)
 	}
-	paths = deduplicatePaths(paths, delimiter)
+	paths = deduplicatePaths(paths)
 	sortPaths(paths, delimiter)
 	contentType := getContentType(jsonp)
 	w.Header().Set("Content-Type", contentType)
@@ -97,7 +99,7 @@ func MetricsFindHandler(startTime time.Time, w http.ResponseWriter, r *http.Requ
 	return nil
 }
 
-func deduplicatePaths(paths []string, delimiter string) []string {
+func deduplicatePaths(paths []string) []string {
 	if len(paths) == 0 {
 		return nil
 	}
@@ -119,15 +121,12 @@ func deduplicatePaths(paths []string, delimiter string) []string {
 // See https://graphite-api.readthedocs.io/en/latest/api.html#metrics-expand
 func MetricsExpandHandler(startTime time.Time, w http.ResponseWriter, r *http.Request) error {
 	deadline := searchutils.GetDeadlineForQuery(r, startTime)
-	if err := r.ParseForm(); err != nil {
-		return fmt.Errorf("cannot parse form values: %w", err)
-	}
 	queries := r.Form["query"]
 	if len(queries) == 0 {
 		return fmt.Errorf("missing `query` arg")
 	}
-	groupByExpr := searchutils.GetBool(r, "groupByExpr")
-	leavesOnly := searchutils.GetBool(r, "leavesOnly")
+	groupByExpr := httputils.GetBool(r, "groupByExpr")
+	leavesOnly := httputils.GetBool(r, "leavesOnly")
 	label := r.FormValue("label")
 	if label == "__name__" {
 		label = ""
@@ -140,12 +139,12 @@ func MetricsExpandHandler(startTime time.Time, w http.ResponseWriter, r *http.Re
 		return fmt.Errorf("`delimiter` query arg must contain only a single char")
 	}
 	jsonp := r.FormValue("jsonp")
-	from, err := searchutils.GetTime(r, "from", 0)
+	from, err := httputils.GetTime(r, "from", 0)
 	if err != nil {
 		return err
 	}
 	ct := startTime.UnixNano() / 1e6
-	until, err := searchutils.GetTime(r, "until", ct)
+	until, err := httputils.GetTime(r, "until", ct)
 	if err != nil {
 		return err
 	}
@@ -202,11 +201,9 @@ func MetricsExpandHandler(startTime time.Time, w http.ResponseWriter, r *http.Re
 // See https://graphite-api.readthedocs.io/en/latest/api.html#metrics-index-json
 func MetricsIndexHandler(startTime time.Time, w http.ResponseWriter, r *http.Request) error {
 	deadline := searchutils.GetDeadlineForQuery(r, startTime)
-	if err := r.ParseForm(); err != nil {
-		return fmt.Errorf("cannot parse form values: %w", err)
-	}
 	jsonp := r.FormValue("jsonp")
-	metricNames, err := netstorage.GetLabelValues("__name__", deadline)
+	sq := storage.NewSearchQuery(0, 0, nil, 0)
+	metricNames, err := netstorage.LabelValues(nil, "__name__", sq, 0, deadline)
 	if err != nil {
 		return fmt.Errorf(`cannot obtain metric names: %w`, err)
 	}
@@ -227,7 +224,7 @@ func metricsFind(tr storage.TimeRange, label, qHead, qTail string, delimiter byt
 	n := strings.IndexAny(qTail, "*{[")
 	if n < 0 {
 		query := qHead + qTail
-		suffixes, err := netstorage.GetTagValueSuffixes(tr, label, query, delimiter, deadline)
+		suffixes, err := netstorage.TagValueSuffixes(nil, tr, label, query, delimiter, *maxTagValueSuffixes, deadline)
 		if err != nil {
 			return nil, err
 		}
@@ -247,7 +244,7 @@ func metricsFind(tr storage.TimeRange, label, qHead, qTail string, delimiter byt
 	}
 	if n == len(qTail)-1 && strings.HasSuffix(qTail, "*") {
 		query := qHead + qTail[:len(qTail)-1]
-		suffixes, err := netstorage.GetTagValueSuffixes(tr, label, query, delimiter, deadline)
+		suffixes, err := netstorage.TagValueSuffixes(nil, tr, label, query, delimiter, *maxTagValueSuffixes, deadline)
 		if err != nil {
 			return nil, err
 		}
@@ -354,7 +351,7 @@ func getRegexpForQuery(query string, delimiter byte) (*regexp.Regexp, error) {
 	if len(tail) > 0 {
 		return nil, fmt.Errorf("unexpected tail left after parsing query %q; tail: %q", query, tail)
 	}
-	re, err := regexp.Compile(rs)
+	re, err := metricsql.CompileRegexp(rs)
 	regexpCache[k] = &regexpCacheEntry{
 		re:  re,
 		err: err,

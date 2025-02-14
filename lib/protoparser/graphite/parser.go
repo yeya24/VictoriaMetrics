@@ -1,12 +1,20 @@
 package graphite
 
 import (
+	"flag"
 	"fmt"
+	"regexp"
 	"strings"
 
+	"github.com/VictoriaMetrics/VictoriaMetrics/lib/bytesutil"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/logger"
 	"github.com/VictoriaMetrics/metrics"
 	"github.com/valyala/fastjson/fastfloat"
+)
+
+var (
+	sanitizeMetricName = flag.Bool("graphite.sanitizeMetricName", false, "Sanitize metric names for the ingested Graphite data. "+
+		"See https://docs.victoriametrics.com/#how-to-send-data-from-graphite-compatible-agents-such-as-statsd")
 )
 
 // graphite text line protocol may use white space or tab as separator
@@ -61,9 +69,6 @@ func (r *Row) reset() {
 
 // UnmarshalMetricAndTags unmarshals metric and optional tags from s.
 func (r *Row) UnmarshalMetricAndTags(s string, tagsPool []Tag) ([]Tag, error) {
-	if strings.Contains(s, " ") {
-		return tagsPool, fmt.Errorf("unexpected whitespace found in %q", s)
-	}
 	n := strings.IndexByte(s, ';')
 	if n < 0 {
 		// No tags
@@ -72,13 +77,12 @@ func (r *Row) UnmarshalMetricAndTags(s string, tagsPool []Tag) ([]Tag, error) {
 		// Tags found
 		r.Metric = s[:n]
 		tagsStart := len(tagsPool)
-		var err error
-		tagsPool, err = unmarshalTags(tagsPool, s[n+1:])
-		if err != nil {
-			return tagsPool, fmt.Errorf("cannot unmarshal tags: %w", err)
-		}
+		tagsPool = unmarshalTags(tagsPool, s[n+1:])
 		tags := tagsPool[tagsStart:]
 		r.Tags = tags[:len(tags):len(tags)]
+	}
+	if *sanitizeMetricName {
+		r.Metric = sanitizer.Transform(r.Metric)
 	}
 	if len(r.Metric) == 0 {
 		return tagsPool, fmt.Errorf("metric cannot be empty")
@@ -88,38 +92,43 @@ func (r *Row) UnmarshalMetricAndTags(s string, tagsPool []Tag) ([]Tag, error) {
 
 func (r *Row) unmarshal(s string, tagsPool []Tag) ([]Tag, error) {
 	r.reset()
-	n := strings.IndexAny(s, graphiteSeparators)
+	sOrig := s
+	s = stripTrailingWhitespace(s)
+	n := strings.LastIndexAny(s, graphiteSeparators)
 	if n < 0 {
-		return tagsPool, fmt.Errorf("cannot find separator between metric and value in %q", s)
+		return tagsPool, fmt.Errorf("cannot find separator between value and timestamp in %q", s)
 	}
-	metricAndTags := s[:n]
-	tail := s[n+1:]
-
+	timestampStr := s[n+1:]
+	valueStr := ""
+	metricAndTags := ""
+	s = stripTrailingWhitespace(s[:n])
+	n = strings.LastIndexAny(s, graphiteSeparators)
+	if n < 0 {
+		// Missing timestamp
+		metricAndTags = stripLeadingWhitespace(s)
+		valueStr = timestampStr
+		timestampStr = ""
+	} else {
+		metricAndTags = stripLeadingWhitespace(s[:n])
+		valueStr = s[n+1:]
+	}
+	metricAndTags = stripTrailingWhitespace(metricAndTags)
 	tagsPool, err := r.UnmarshalMetricAndTags(metricAndTags, tagsPool)
 	if err != nil {
-		return tagsPool, err
+		return tagsPool, fmt.Errorf("cannot parse metric and tags from %q: %w; original line: %q", metricAndTags, err, sOrig)
 	}
-
-	n = strings.IndexAny(tail, graphiteSeparators)
-	if n < 0 {
-		// There is no timestamp. Use default timestamp instead.
-		v, err := fastfloat.Parse(tail)
+	if len(timestampStr) > 0 {
+		ts, err := fastfloat.Parse(timestampStr)
 		if err != nil {
-			return tagsPool, fmt.Errorf("cannot unmarshal value from %q: %w", tail, err)
+			return tagsPool, fmt.Errorf("cannot unmarshal timestamp from %q: %w; orignal line: %q", timestampStr, err, sOrig)
 		}
-		r.Value = v
-		return tagsPool, nil
+		r.Timestamp = int64(ts)
 	}
-	v, err := fastfloat.Parse(tail[:n])
+	v, err := fastfloat.Parse(valueStr)
 	if err != nil {
-		return tagsPool, fmt.Errorf("cannot unmarshal value from %q: %w", tail[:n], err)
-	}
-	ts, err := fastfloat.Parse(tail[n+1:])
-	if err != nil {
-		return tagsPool, fmt.Errorf("cannot unmarshal timestamp from %q: %w", tail[n+1:], err)
+		return tagsPool, fmt.Errorf("cannot unmarshal metric value from %q: %w; original line: %q", valueStr, err, sOrig)
 	}
 	r.Value = v
-	r.Timestamp = int64(ts)
 	return tagsPool, nil
 }
 
@@ -140,11 +149,11 @@ func unmarshalRow(dst []Row, s string, tagsPool []Tag) ([]Row, []Tag) {
 	if len(s) > 0 && s[len(s)-1] == '\r' {
 		s = s[:len(s)-1]
 	}
+	s = stripLeadingWhitespace(s)
 	if len(s) == 0 {
 		// Skip empty line
 		return dst, tagsPool
 	}
-
 	if cap(dst) > len(dst) {
 		dst = dst[:len(dst)+1]
 	} else {
@@ -163,7 +172,7 @@ func unmarshalRow(dst []Row, s string, tagsPool []Tag) ([]Row, []Tag) {
 
 var invalidLines = metrics.NewCounter(`vm_rows_invalid_total{type="graphite"}`)
 
-func unmarshalTags(dst []Tag, s string) ([]Tag, error) {
+func unmarshalTags(dst []Tag, s string) []Tag {
 	for {
 		if cap(dst) > len(dst) {
 			dst = dst[:len(dst)+1]
@@ -180,7 +189,7 @@ func unmarshalTags(dst []Tag, s string) ([]Tag, error) {
 				// Skip empty tag
 				dst = dst[:len(dst)-1]
 			}
-			return dst, nil
+			return dst
 		}
 		tag.unmarshal(s[:n])
 		s = s[n+1:]
@@ -214,4 +223,47 @@ func (t *Tag) unmarshal(s string) {
 		t.Key = s[:n]
 		t.Value = s[n+1:]
 	}
+	if *sanitizeMetricName {
+		t.Key = sanitizer.Transform(t.Key)
+	}
 }
+
+func stripTrailingWhitespace(s string) string {
+	n := len(s)
+	for {
+		n--
+		if n < 0 {
+			return ""
+		}
+		ch := s[n]
+		// graphite text line protocol may use white space or tab as separator
+		// See https://github.com/grobian/carbon-c-relay/commit/f3ffe6cc2b52b07d14acbda649ad3fd6babdd528
+		if ch != ' ' && ch != '\t' {
+			return s[:n+1]
+		}
+	}
+}
+
+func stripLeadingWhitespace(s string) string {
+	for len(s) > 0 {
+		ch := s[0]
+		if ch != ' ' && ch != '\t' {
+			return s
+		}
+		s = s[1:]
+	}
+	return ""
+}
+
+var sanitizer = bytesutil.NewFastStringTransformer(func(s string) string {
+	// Apply rule to drop some chars to preserve backwards compatibility
+	s = repeatedDots.ReplaceAllLiteralString(s, ".")
+
+	// Replace any remaining illegal chars
+	return allowedChars.ReplaceAllLiteralString(s, "_")
+})
+
+var (
+	repeatedDots = regexp.MustCompile(`[.]+`)
+	allowedChars = regexp.MustCompile(`[^a-zA-Z0-9:_.]`)
+)

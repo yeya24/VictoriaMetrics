@@ -6,30 +6,40 @@ import (
 	"math"
 	"sort"
 	"strings"
-	"sync"
-	"sync/atomic"
 	"time"
 
 	"github.com/VictoriaMetrics/VictoriaMetrics/app/vmselect/netstorage"
 	"github.com/VictoriaMetrics/VictoriaMetrics/app/vmselect/querystats"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/decimal"
+	"github.com/VictoriaMetrics/VictoriaMetrics/lib/logger"
+	"github.com/VictoriaMetrics/VictoriaMetrics/lib/querytracer"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/storage"
-	"github.com/VictoriaMetrics/metrics"
 	"github.com/VictoriaMetrics/metricsql"
 )
 
 var (
+	maxResponseSeries = flag.Int("search.maxResponseSeries", 0, "The maximum number of time series which can be returned from /api/v1/query and /api/v1/query_range . "+
+		"The limit is disabled if it equals to 0. See also -search.maxPointsPerTimeseries and -search.maxUniqueTimeseries")
 	treatDotsAsIsInRegexps = flag.Bool("search.treatDotsAsIsInRegexps", false, "Whether to treat dots as is in regexp label filters used in queries. "+
 		`For example, foo{bar=~"a.b.c"} will be automatically converted to foo{bar=~"a\\.b\\.c"}, i.e. all the dots in regexp filters will be automatically escaped `+
 		`in order to match only dot char instead of matching any char. Dots in ".+", ".*" and ".{n}" regexps aren't escaped. `+
 		`This option is DEPRECATED in favor of {__graphite__="a.*.c"} syntax for selecting metrics matching the given Graphite metrics filter`)
+	disableImplicitConversion = flag.Bool("search.disableImplicitConversion", false, "Whether to return an error for queries that rely on implicit subquery conversions, "+
+		"see https://docs.victoriametrics.com/metricsql/#subqueries for details. "+
+		"See also -search.logImplicitConversion.")
+	logImplicitConversion = flag.Bool("search.logImplicitConversion", false, "Whether to log queries with implicit subquery conversions, "+
+		"see https://docs.victoriametrics.com/metricsql/#subqueries for details. "+
+		"Such conversion can be disabled using -search.disableImplicitConversion.")
 )
 
 // Exec executes q for the given ec.
-func Exec(ec *EvalConfig, q string, isFirstPointOnly bool) ([]netstorage.Result, error) {
+func Exec(qt *querytracer.Tracer, ec *EvalConfig, q string, isFirstPointOnly bool) ([]netstorage.Result, error) {
 	if querystats.Enabled() {
 		startTime := time.Now()
-		defer querystats.RegisterQuery(q, ec.End-ec.Start, startTime)
+		defer func() {
+			querystats.RegisterQuery(q, ec.End-ec.Start, startTime)
+			ec.QueryStats.addExecutionTimeMsec(startTime)
+		}()
 	}
 
 	ec.validate()
@@ -39,25 +49,45 @@ func Exec(ec *EvalConfig, q string, isFirstPointOnly bool) ([]netstorage.Result,
 		return nil, err
 	}
 
+	if *disableImplicitConversion || *logImplicitConversion {
+		isInvalid := metricsql.IsLikelyInvalid(e)
+		if isInvalid && *disableImplicitConversion {
+			// we don't add query=%q to err message as it will be added by the caller
+			return nil, fmt.Errorf("query requires implicit conversion and is rejected according to -search.disableImplicitConversion command-line flag. " +
+				"See https://docs.victoriametrics.com/metricsql/#implicit-query-conversions for details")
+		}
+		if isInvalid && *logImplicitConversion {
+			logger.Warnf("query=%q requires implicit conversion, see https://docs.victoriametrics.com/metricsql/#implicit-query-conversions for details", e.AppendString(nil))
+		}
+	}
+
 	qid := activeQueriesV.Add(ec, q)
-	rv, err := evalExpr(ec, e)
+	rv, err := evalExpr(qt, ec, e)
 	activeQueriesV.Remove(qid)
 	if err != nil {
 		return nil, err
 	}
-
 	if isFirstPointOnly {
 		// Remove all the points except the first one from every time series.
 		for _, ts := range rv {
 			ts.Values = ts.Values[:1]
 			ts.Timestamps = ts.Timestamps[:1]
 		}
+		qt.Printf("leave only the first point in every series")
 	}
-
-	maySort := maySortResults(e, rv)
+	maySort := maySortResults(e)
 	result, err := timeseriesToResult(rv, maySort)
+	if *maxResponseSeries > 0 && len(result) > *maxResponseSeries {
+		return nil, fmt.Errorf("the response contains more than -search.maxResponseSeries=%d time series: %d series; either increase -search.maxResponseSeries "+
+			"or change the query in order to return smaller number of series", *maxResponseSeries, len(result))
+	}
 	if err != nil {
 		return nil, err
+	}
+	if maySort {
+		qt.Printf("sort series by metric name and labels")
+	} else {
+		qt.Printf("do not sort series by metric name and labels")
 	}
 	if n := ec.RoundDigits; n < 100 {
 		for i := range result {
@@ -66,16 +96,19 @@ func Exec(ec *EvalConfig, q string, isFirstPointOnly bool) ([]netstorage.Result,
 				values[j] = decimal.RoundToDecimalDigits(v, n)
 			}
 		}
+		qt.Printf("round series values to %d decimal digits after the point", n)
 	}
-	return result, err
+	return result, nil
 }
 
-func maySortResults(e metricsql.Expr, tss []*timeseries) bool {
+func maySortResults(e metricsql.Expr) bool {
 	switch v := e.(type) {
 	case *metricsql.FuncExpr:
 		switch strings.ToLower(v.Name) {
-		case "sort", "sort_desc",
-			"sort_by_label", "sort_by_label_desc":
+		case "sort", "sort_desc", "limit_offset",
+			"sort_by_label", "sort_by_label_desc",
+			"sort_by_label_numeric", "sort_by_label_numeric_desc":
+			// Results already sorted
 			return false
 		}
 	case *metricsql.AggrFuncExpr:
@@ -83,6 +116,13 @@ func maySortResults(e metricsql.Expr, tss []*timeseries) bool {
 		case "topk", "bottomk", "outliersk",
 			"topk_max", "topk_min", "topk_avg", "topk_median", "topk_last",
 			"bottomk_max", "bottomk_min", "bottomk_avg", "bottomk_median", "bottomk_last":
+			// Results already sorted
+			return false
+		}
+	case *metricsql.BinaryOpExpr:
+		if strings.EqualFold(v.Op, "or") {
+			// Do not sort results for `a or b` in the same way as Prometheus does.
+			// See https://github.com/VictoriaMetrics/VictoriaMetrics/issues/4763
 			return false
 		}
 	}
@@ -90,31 +130,38 @@ func maySortResults(e metricsql.Expr, tss []*timeseries) bool {
 }
 
 func timeseriesToResult(tss []*timeseries, maySort bool) ([]netstorage.Result, error) {
-	tss = removeNaNs(tss)
+	tss = removeEmptySeries(tss)
+	if maySort {
+		sortSeriesByMetricName(tss)
+	}
+
 	result := make([]netstorage.Result, len(tss))
 	m := make(map[string]struct{}, len(tss))
 	bb := bbPool.Get()
 	for i, ts := range tss {
 		bb.B = marshalMetricNameSorted(bb.B[:0], &ts.MetricName)
-		if _, ok := m[string(bb.B)]; ok {
+		k := string(bb.B)
+		if _, ok := m[k]; ok {
 			return nil, fmt.Errorf(`duplicate output timeseries: %s`, stringMetricName(&ts.MetricName))
 		}
-		m[string(bb.B)] = struct{}{}
+		m[k] = struct{}{}
 
 		rs := &result[i]
-		rs.MetricName.CopyFrom(&ts.MetricName)
-		rs.Values = append(rs.Values[:0], ts.Values...)
-		rs.Timestamps = append(rs.Timestamps[:0], ts.Timestamps...)
+		rs.MetricName.MoveFrom(&ts.MetricName)
+		rs.Values = ts.Values
+		ts.Values = nil
+		rs.Timestamps = ts.Timestamps
+		ts.Timestamps = nil
 	}
 	bbPool.Put(bb)
 
-	if maySort {
-		sort.Slice(result, func(i, j int) bool {
-			return metricNameLess(&result[i].MetricName, &result[j].MetricName)
-		})
-	}
-
 	return result, nil
+}
+
+func sortSeriesByMetricName(tss []*timeseries) {
+	sort.Slice(tss, func(i, j int) bool {
+		return metricNameLess(&tss[i].MetricName, &tss[j].MetricName)
+	})
 }
 
 func metricNameLess(a, b *storage.MetricName) bool {
@@ -143,7 +190,7 @@ func metricNameLess(a, b *storage.MetricName) bool {
 	return len(ats) < len(bts)
 }
 
-func removeNaNs(tss []*timeseries) []*timeseries {
+func removeEmptySeries(tss []*timeseries) []*timeseries {
 	rvs := tss[:0]
 	for _, ts := range tss {
 		allNans := true
@@ -220,7 +267,7 @@ func getReverseCmpOp(op string) string {
 }
 
 func parsePromQLWithCache(q string) (metricsql.Expr, error) {
-	pcv := parseCacheV.Get(q)
+	pcv := parseCacheV.get(q)
 	if pcv == nil {
 		e, err := metricsql.Parse(q)
 		if err == nil {
@@ -234,7 +281,7 @@ func parsePromQLWithCache(q string) (metricsql.Expr, error) {
 			e:   e,
 			err: err,
 		}
-		parseCacheV.Put(q, pcv)
+		parseCacheV.put(q, pcv)
 	}
 	if pcv.err != nil {
 		return nil, pcv.err
@@ -248,10 +295,12 @@ func escapeDotsInRegexpLabelFilters(e metricsql.Expr) metricsql.Expr {
 		if !ok {
 			return
 		}
-		for i := range me.LabelFilters {
-			f := &me.LabelFilters[i]
-			if f.IsRegexp {
-				f.Value = escapeDots(f.Value)
+		for _, lfs := range me.LabelFilterss {
+			for i := range lfs {
+				f := &lfs[i]
+				if f.IsRegexp {
+					f.Value = escapeDots(f.Value)
+				}
 			}
 		}
 	})
@@ -275,84 +324,4 @@ func escapeDots(s string) string {
 		}
 	}
 	return string(result)
-}
-
-var parseCacheV = func() *parseCache {
-	pc := &parseCache{
-		m: make(map[string]*parseCacheValue),
-	}
-	metrics.NewGauge(`vm_cache_requests_total{type="promql/parse"}`, func() float64 {
-		return float64(pc.Requests())
-	})
-	metrics.NewGauge(`vm_cache_misses_total{type="promql/parse"}`, func() float64 {
-		return float64(pc.Misses())
-	})
-	metrics.NewGauge(`vm_cache_entries{type="promql/parse"}`, func() float64 {
-		return float64(pc.Len())
-	})
-	return pc
-}()
-
-const parseCacheMaxLen = 10e3
-
-type parseCacheValue struct {
-	e   metricsql.Expr
-	err error
-}
-
-type parseCache struct {
-	// Move atomic counters to the top of struct for 8-byte alignment on 32-bit arch.
-	// See https://github.com/VictoriaMetrics/VictoriaMetrics/issues/212
-
-	requests uint64
-	misses   uint64
-
-	m  map[string]*parseCacheValue
-	mu sync.RWMutex
-}
-
-func (pc *parseCache) Requests() uint64 {
-	return atomic.LoadUint64(&pc.requests)
-}
-
-func (pc *parseCache) Misses() uint64 {
-	return atomic.LoadUint64(&pc.misses)
-}
-
-func (pc *parseCache) Len() uint64 {
-	pc.mu.RLock()
-	n := len(pc.m)
-	pc.mu.RUnlock()
-	return uint64(n)
-}
-
-func (pc *parseCache) Get(q string) *parseCacheValue {
-	atomic.AddUint64(&pc.requests, 1)
-
-	pc.mu.RLock()
-	pcv := pc.m[q]
-	pc.mu.RUnlock()
-
-	if pcv == nil {
-		atomic.AddUint64(&pc.misses, 1)
-	}
-	return pcv
-}
-
-func (pc *parseCache) Put(q string, pcv *parseCacheValue) {
-	pc.mu.Lock()
-	overflow := len(pc.m) - parseCacheMaxLen
-	if overflow > 0 {
-		// Remove 10% of items from the cache.
-		overflow = int(float64(len(pc.m)) * 0.1)
-		for k := range pc.m {
-			delete(pc.m, k)
-			overflow--
-			if overflow <= 0 {
-				break
-			}
-		}
-	}
-	pc.m[q] = pcv
-	pc.mu.Unlock()
 }

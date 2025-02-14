@@ -1,14 +1,16 @@
 package kubernetes
 
 import (
+	"context"
+	"crypto/tls"
 	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"net/http"
 	"net/url"
+	"os"
 	"reflect"
 	"strconv"
 	"strings"
@@ -16,12 +18,25 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/VictoriaMetrics/VictoriaMetrics/lib/logger"
-	"github.com/VictoriaMetrics/VictoriaMetrics/lib/promauth"
 	"github.com/VictoriaMetrics/metrics"
+	"golang.org/x/net/http2"
+
+	"github.com/VictoriaMetrics/VictoriaMetrics/lib/cgroup"
+	"github.com/VictoriaMetrics/VictoriaMetrics/lib/logger"
+	"github.com/VictoriaMetrics/VictoriaMetrics/lib/netutil"
+	"github.com/VictoriaMetrics/VictoriaMetrics/lib/promauth"
+	"github.com/VictoriaMetrics/VictoriaMetrics/lib/promutils"
+	"github.com/VictoriaMetrics/VictoriaMetrics/lib/timerpool"
+	"github.com/VictoriaMetrics/VictoriaMetrics/lib/timeutil"
 )
 
-var apiServerTimeout = flag.Duration("promscrape.kubernetes.apiServerTimeout", 30*time.Minute, "How frequently to reload the full state from Kuberntes API server")
+var (
+	apiServerTimeout      = flag.Duration("promscrape.kubernetes.apiServerTimeout", 30*time.Minute, "How frequently to reload the full state from Kubernetes API server")
+	attachNodeMetadataAll = flag.Bool("promscrape.kubernetes.attachNodeMetadataAll", false, "Whether to set attach_metadata.node=true for all the kubernetes_sd_configs at -promscrape.config . "+
+		"It is possible to set attach_metadata.node=false individually per each kubernetes_sd_configs . See https://docs.victoriametrics.com/sd_configs/#kubernetes_sd_configs")
+	useHTTP2Client = flag.Bool("promscrape.kubernetes.useHTTP2Client", false, "Whether to use HTTP/2 client for connection to Kubernetes API server."+
+		" This may reduce amount of concurrent connections to API server when watching for a big number of Kubernetes objects.")
+)
 
 // WatchEvent is a watch event returned from API server endpoints if `watch=1` query arg is set.
 //
@@ -36,7 +51,7 @@ type object interface {
 	key() string
 
 	// getTargetLabels must be called under gw.mu lock.
-	getTargetLabels(gw *groupWatcher) []map[string]string
+	getTargetLabels(gw *groupWatcher) []*promutils.Labels
 }
 
 // parseObjectFunc must parse object from the given data.
@@ -45,7 +60,7 @@ type parseObjectFunc func(data []byte) (object, error)
 // parseObjectListFunc must parse objectList from the given r.
 type parseObjectListFunc func(r io.Reader) (map[string]object, ListMeta, error)
 
-// apiWatcher is used for watching for Kuberntes object changes and caching their latest states.
+// apiWatcher is used for watching for Kubernetes object changes and caching their latest states.
 type apiWatcher struct {
 	role string
 
@@ -54,62 +69,106 @@ type apiWatcher struct {
 
 	gw *groupWatcher
 
-	// swos contains per-urlWatcher maps of ScrapeWork objects for the given apiWatcher
-	swosByURLWatcher     map[*urlWatcher]map[string][]interface{}
+	// swosByURLWatcher contains per-urlWatcher maps of ScrapeWork objects for the given apiWatcher
+	swosByURLWatcher     map[*urlWatcher]map[string][]any
 	swosByURLWatcherLock sync.Mutex
 
 	swosCount *metrics.Counter
 }
 
-func newAPIWatcher(apiServer string, ac *promauth.Config, sdc *SDConfig, swcFunc ScrapeWorkConstructorFunc) *apiWatcher {
+func newAPIWatcher(apiServer string, ac *promauth.Config, sdc *SDConfig, swcFunc ScrapeWorkConstructorFunc) (*apiWatcher, error) {
 	namespaces := sdc.Namespaces.Names
+	if len(namespaces) == 0 {
+		if sdc.Namespaces.OwnNamespace {
+			namespace, err := os.ReadFile("/var/run/secrets/kubernetes.io/serviceaccount/namespace")
+			if err != nil {
+				return nil, fmt.Errorf("cannot determine namespace for the current pod according to `own_namespace: true` option in kubernetes_sd_config: %w", err)
+			}
+			namespaces = []string{string(namespace)}
+		}
+	}
 	selectors := sdc.Selectors
-	proxyURL := sdc.ProxyURL.URL()
-	gw := getGroupWatcher(apiServer, ac, namespaces, selectors, proxyURL)
+	attachNodeMetadata := *attachNodeMetadataAll
+	if sdc.AttachMetadata != nil {
+		attachNodeMetadata = sdc.AttachMetadata.Node
+	}
+	proxyURL := sdc.ProxyURL.GetURL()
+	gw := getGroupWatcher(apiServer, ac, namespaces, selectors, attachNodeMetadata, proxyURL)
 	role := sdc.role()
-	return &apiWatcher{
+	aw := &apiWatcher{
 		role:             role,
 		swcFunc:          swcFunc,
 		gw:               gw,
-		swosByURLWatcher: make(map[*urlWatcher]map[string][]interface{}),
+		swosByURLWatcher: make(map[*urlWatcher]map[string][]any),
 		swosCount:        metrics.GetOrCreateCounter(fmt.Sprintf(`vm_promscrape_discovery_kubernetes_scrape_works{role=%q}`, role)),
 	}
+	return aw, nil
 }
 
 func (aw *apiWatcher) mustStart() {
+	aw.gw.apiWatcherInflightStartCalls.Add(1)
 	aw.gw.startWatchersForRole(aw.role, aw)
+	aw.gw.apiWatcherInflightStartCalls.Add(-1)
+}
+
+func (aw *apiWatcher) updateSwosCount(multiplier int, swosByKey map[string][]any) {
+	n := 0
+	for _, swos := range swosByKey {
+		n += len(swos)
+	}
+	n *= multiplier
+	aw.swosCount.Add(n)
 }
 
 func (aw *apiWatcher) mustStop() {
 	aw.gw.unsubscribeAPIWatcher(aw)
 	aw.swosByURLWatcherLock.Lock()
 	for _, swosByKey := range aw.swosByURLWatcher {
-		aw.swosCount.Add(-len(swosByKey))
+		aw.updateSwosCount(-1, swosByKey)
 	}
-	aw.swosByURLWatcher = make(map[*urlWatcher]map[string][]interface{})
+	aw.swosByURLWatcher = make(map[*urlWatcher]map[string][]any)
 	aw.swosByURLWatcherLock.Unlock()
 }
 
-func (aw *apiWatcher) reloadScrapeWorks(uw *urlWatcher, swosByKey map[string][]interface{}) {
+func (aw *apiWatcher) replaceScrapeWorks(uw *urlWatcher, swosByKey map[string][]any) {
 	aw.swosByURLWatcherLock.Lock()
-	aw.swosCount.Add(len(swosByKey) - len(aw.swosByURLWatcher[uw]))
+	aw.updateSwosCount(-1, aw.swosByURLWatcher[uw])
+	aw.updateSwosCount(1, swosByKey)
 	aw.swosByURLWatcher[uw] = swosByKey
 	aw.swosByURLWatcherLock.Unlock()
 }
 
-func (aw *apiWatcher) setScrapeWorks(uw *urlWatcher, key string, labels []map[string]string) {
-	swos := aw.getScrapeWorkObjectsForLabels(labels)
+func (aw *apiWatcher) updateScrapeWorks(uw *urlWatcher, swosByKey map[string][]any) {
+	aw.swosByURLWatcherLock.Lock()
+	dst := aw.swosByURLWatcher[uw]
+	if dst == nil {
+		dst = make(map[string][]any)
+		aw.swosByURLWatcher[uw] = dst
+	}
+	for key, swos := range swosByKey {
+		aw.swosCount.Add(len(swos) - len(dst[key]))
+		if len(swos) == 0 {
+			delete(dst, key)
+		} else {
+			dst[key] = swos
+		}
+	}
+	aw.swosByURLWatcherLock.Unlock()
+}
+
+func (aw *apiWatcher) setScrapeWorks(uw *urlWatcher, key string, labelss []*promutils.Labels) {
+	swos := getScrapeWorkObjectsForLabels(aw.swcFunc, labelss)
 	aw.swosByURLWatcherLock.Lock()
 	swosByKey := aw.swosByURLWatcher[uw]
 	if swosByKey == nil {
-		swosByKey = make(map[string][]interface{})
+		swosByKey = make(map[string][]any)
 		aw.swosByURLWatcher[uw] = swosByKey
 	}
 	aw.swosCount.Add(len(swos) - len(swosByKey[key]))
-	if len(swos) > 0 {
-		swosByKey[key] = swos
-	} else {
+	if len(swos) == 0 {
 		delete(swosByKey, key)
+	} else {
+		swosByKey[key] = swos
 	}
 	aw.swosByURLWatcherLock.Unlock()
 }
@@ -124,10 +183,11 @@ func (aw *apiWatcher) removeScrapeWorks(uw *urlWatcher, key string) {
 	aw.swosByURLWatcherLock.Unlock()
 }
 
-func (aw *apiWatcher) getScrapeWorkObjectsForLabels(labelss []map[string]string) []interface{} {
-	swos := make([]interface{}, 0, len(labelss))
+func getScrapeWorkObjectsForLabels(swcFunc ScrapeWorkConstructorFunc, labelss []*promutils.Labels) []any {
+	// Do not pre-allocate swos, since it is likely the swos will be empty because of relabeling
+	var swos []any
 	for _, labels := range labelss {
-		swo := aw.swcFunc(labels)
+		swo := swcFunc(labels)
 		// The reflect check is needed because of https://mangatmodi.medium.com/go-check-nil-interface-the-right-way-d142776edef1
 		if swo != nil && !reflect.ValueOf(swo).IsNil() {
 			swos = append(swos, swo)
@@ -137,84 +197,136 @@ func (aw *apiWatcher) getScrapeWorkObjectsForLabels(labelss []map[string]string)
 }
 
 // getScrapeWorkObjects returns all the ScrapeWork objects for the given aw.
-func (aw *apiWatcher) getScrapeWorkObjects() []interface{} {
+func (aw *apiWatcher) getScrapeWorkObjects() []any {
 	aw.gw.registerPendingAPIWatchers()
 
+	swos := make([]any, 0, aw.swosCount.Get())
 	aw.swosByURLWatcherLock.Lock()
-	defer aw.swosByURLWatcherLock.Unlock()
-
-	size := 0
-	for _, swosByKey := range aw.swosByURLWatcher {
-		for _, swosLocal := range swosByKey {
-			size += len(swosLocal)
-		}
-	}
-	swos := make([]interface{}, 0, size)
 	for _, swosByKey := range aw.swosByURLWatcher {
 		for _, swosLocal := range swosByKey {
 			swos = append(swos, swosLocal...)
 		}
 	}
+	aw.swosByURLWatcherLock.Unlock()
 	return swos
 }
 
 // groupWatcher watches for Kubernetes objects on the given apiServer with the given namespaces,
-// selectors using the given client.
+// selectors and attachNodeMetadata using the given client.
 type groupWatcher struct {
+	// The number of in-flight apiWatcher.mustStart() calls for the given groupWatcher.
+	// This field is used by groupWatchersCleaner() in order to determine when the given groupWatcher can be stopped.
+	apiWatcherInflightStartCalls atomic.Int32
+
 	// Old Kubernetes doesn't support /apis/networking.k8s.io/v1/, so /apis/networking.k8s.io/v1beta1/ must be used instead.
 	// This flag is used for automatic substitution of v1 API path with v1beta1 API path during requests to apiServer.
-	useNetworkingV1Beta1 uint32
+	useNetworkingV1Beta1 atomic.Bool
 
 	// Old Kubernetes doesn't support /apis/discovery.k8s.io/v1/, so discovery.k8s.io/v1beta1/ must be used instead.
 	// This flag is used for automatic substitution of v1 API path with v1beta1 API path during requests to apiServer.
-	useDiscoveryV1Beta1 uint32
+	useDiscoveryV1Beta1 atomic.Bool
 
-	apiServer     string
-	namespaces    []string
-	selectors     []Selector
-	getAuthHeader func() string
-	client        *http.Client
+	apiServer          string
+	namespaces         []string
+	selectors          []Selector
+	attachNodeMetadata bool
+
+	setHeaders func(req *http.Request) error
+	client     *http.Client
 
 	mu sync.Mutex
 	m  map[string]*urlWatcher
+
+	// cancel is used for stopping all the urlWatcher instances inside m,
+	// which must check for ctx.Done() when performing their background watch work.
+	ctx    context.Context
+	cancel context.CancelFunc
+
+	// noAPIWatchers is set to true when there are no API watchers for the given groupWatcher.
+	// This field is used for determining when it is safe to stop all the urlWatcher instances
+	// for the given groupWatcher.
+	noAPIWatchers bool
 }
 
-func newGroupWatcher(apiServer string, ac *promauth.Config, namespaces []string, selectors []Selector, proxyURL *url.URL) *groupWatcher {
+var (
+	httpClientsCache = make(map[string]*http.Client)
+	httpClientsLock  sync.Mutex
+)
+
+func getHTTPClient(ac *promauth.Config, proxyURL *url.URL) *http.Client {
+	key := fmt.Sprintf("authConfig=%s, proxyURL=%s", ac.String(), proxyURL)
+	httpClientsLock.Lock()
+	if c, ok := httpClientsCache[key]; ok {
+		httpClientsLock.Unlock()
+		return c
+	}
+
 	var proxy func(*http.Request) (*url.URL, error)
 	if proxyURL != nil {
 		proxy = http.ProxyURL(proxyURL)
 	}
-	client := &http.Client{
-		Transport: &http.Transport{
-			TLSClientConfig:     ac.NewTLSConfig(),
+	getTransport := func(cfg *tls.Config) http.RoundTripper {
+		return &http.Transport{
 			Proxy:               proxy,
+			DialContext:         netutil.Dialer.DialContext,
 			TLSHandshakeTimeout: 10 * time.Second,
 			IdleConnTimeout:     *apiServerTimeout,
 			MaxIdleConnsPerHost: 100,
-		},
-		Timeout: *apiServerTimeout,
+			TLSClientConfig:     cfg,
+		}
 	}
-	return &groupWatcher{
-		apiServer:     apiServer,
-		getAuthHeader: ac.GetAuthHeader,
-		namespaces:    namespaces,
-		selectors:     selectors,
-		client:        client,
-		m:             make(map[string]*urlWatcher),
+	if *useHTTP2Client {
+		// proxy is not supported for http2 client
+		// see: https://github.com/golang/go/issues/26479
+		getTransport = func(cfg *tls.Config) http.RoundTripper {
+			return &http2.Transport{
+				IdleConnTimeout: *apiServerTimeout,
+				TLSClientConfig: cfg,
+				PingTimeout:     10 * time.Second,
+			}
+		}
 	}
+	c := &http.Client{
+		Transport: ac.NewRoundTripperFromGetter(getTransport),
+		Timeout:   *apiServerTimeout,
+	}
+	httpClientsCache[key] = c
+	httpClientsLock.Unlock()
+	return c
 }
 
-func getGroupWatcher(apiServer string, ac *promauth.Config, namespaces []string, selectors []Selector, proxyURL *url.URL) *groupWatcher {
+func newGroupWatcher(apiServer string, ac *promauth.Config, namespaces []string, selectors []Selector, attachNodeMetadata bool, proxyURL *url.URL) *groupWatcher {
+	client := getHTTPClient(ac, proxyURL)
+	ctx, cancel := context.WithCancel(context.Background())
+	gw := &groupWatcher{
+		apiServer:          apiServer,
+		namespaces:         namespaces,
+		selectors:          selectors,
+		attachNodeMetadata: attachNodeMetadata,
+
+		setHeaders: func(req *http.Request) error {
+			return ac.SetHeaders(req, true)
+		},
+		client: client,
+		m:      make(map[string]*urlWatcher),
+
+		ctx:    ctx,
+		cancel: cancel,
+	}
+	return gw
+}
+
+func getGroupWatcher(apiServer string, ac *promauth.Config, namespaces []string, selectors []Selector, attachNodeMetadata bool, proxyURL *url.URL) *groupWatcher {
 	proxyURLStr := "<nil>"
 	if proxyURL != nil {
 		proxyURLStr = proxyURL.String()
 	}
-	key := fmt.Sprintf("apiServer=%s, namespaces=%s, selectors=%s, proxyURL=%s, authConfig=%s",
-		apiServer, namespaces, selectorsKey(selectors), proxyURLStr, ac.String())
+	key := fmt.Sprintf("apiServer=%s, namespaces=%s, selectors=%s, attachNodeMetadata=%v, proxyURL=%s, authConfig=%s",
+		apiServer, namespaces, selectorsKey(selectors), attachNodeMetadata, proxyURLStr, ac.String())
 	groupWatchersLock.Lock()
 	gw := groupWatchers[key]
 	if gw == nil {
-		gw = newGroupWatcher(apiServer, ac, namespaces, selectors, proxyURL)
+		gw = newGroupWatcher(apiServer, ac, namespaces, selectors, attachNodeMetadata, proxyURL)
 		groupWatchers[key] = gw
 	}
 	groupWatchersLock.Unlock()
@@ -231,7 +343,7 @@ func selectorsKey(selectors []Selector) string {
 
 var (
 	groupWatchersLock sync.Mutex
-	groupWatchers     = make(map[string]*groupWatcher)
+	groupWatchers     map[string]*groupWatcher
 
 	_ = metrics.NewGauge(`vm_promscrape_discovery_kubernetes_group_watchers`, func() float64 {
 		groupWatchersLock.Lock()
@@ -241,10 +353,93 @@ var (
 	})
 )
 
-func (gw *groupWatcher) getObjectByRoleLocked(role, namespace, name string) object {
-	if gw == nil {
-		// this is needed for testing
+func init() {
+	groupWatchers = make(map[string]*groupWatcher)
+	go groupWatchersCleaner()
+}
+
+func groupWatchersCleaner() {
+	for {
+		time.Sleep(7 * time.Second)
+		groupWatchersLock.Lock()
+		for key, gw := range groupWatchers {
+			gw.mu.Lock()
+			// Calculate the number of apiWatcher instances subscribed to gw.
+			awsTotal := 0
+			for _, uw := range gw.m {
+				awsTotal += len(uw.aws) + len(uw.awsPending)
+			}
+
+			if awsTotal == 0 && gw.apiWatcherInflightStartCalls.Load() == 0 {
+				// There are no API watchers subscribed to gw and there are no in-flight apiWatcher.mustStart() calls.
+				// Stop all the urlWatcher instances at gw and drop gw from groupWatchers in this case,
+				// but do it only on the second iteration in order to reduce urlWatcher churn
+				// during scrape config reloads.
+				if gw.noAPIWatchers {
+					gw.cancel()
+					delete(groupWatchers, key)
+				} else {
+					gw.noAPIWatchers = true
+				}
+			} else {
+				gw.noAPIWatchers = false
+			}
+			gw.mu.Unlock()
+		}
+		groupWatchersLock.Unlock()
+	}
+}
+
+type swosByKeyWithLock struct {
+	mu        sync.Mutex
+	swosByKey map[string][]any
+}
+
+func (gw *groupWatcher) getScrapeWorkObjectsByAPIWatcherLocked(objectsByKey map[string]object, awsMap map[*apiWatcher]struct{}) map[*apiWatcher]*swosByKeyWithLock {
+	if len(awsMap) == 0 {
 		return nil
+	}
+	swosByAPIWatcher := make(map[*apiWatcher]*swosByKeyWithLock, len(awsMap))
+	for aw := range awsMap {
+		swosByAPIWatcher[aw] = &swosByKeyWithLock{
+			swosByKey: make(map[string][]any),
+		}
+	}
+
+	// Generate ScrapeWork objects in parallel on available CPU cores.
+	// This should reduce the time needed for their generation on systems with many CPU cores.
+	var wg sync.WaitGroup
+	limiterCh := make(chan struct{}, cgroup.AvailableCPUs())
+	for key, o := range objectsByKey {
+		labelss := o.getTargetLabels(gw)
+		wg.Add(1)
+		limiterCh <- struct{}{}
+		go func(key string, labelss []*promutils.Labels) {
+			for aw, e := range swosByAPIWatcher {
+				swos := getScrapeWorkObjectsForLabels(aw.swcFunc, labelss)
+				e.mu.Lock()
+				e.swosByKey[key] = swos
+				e.mu.Unlock()
+			}
+			putLabelssToPool(labelss)
+			wg.Done()
+			<-limiterCh
+		}(key, labelss)
+	}
+	wg.Wait()
+	return swosByAPIWatcher
+}
+
+func putLabelssToPool(labelss []*promutils.Labels) {
+	for _, labels := range labelss {
+		promutils.PutLabels(labels)
+	}
+}
+
+func (gw *groupWatcher) getObjectByRoleLocked(role, namespace, name string) object {
+	if role == "node" {
+		// Node objects have no namespace
+		namespace = ""
 	}
 	key := namespace + "/" + name
 	for _, uw := range gw.m {
@@ -252,7 +447,7 @@ func (gw *groupWatcher) getObjectByRoleLocked(role, namespace, name string) obje
 			// Role mismatch
 			continue
 		}
-		if uw.namespace != "" && uw.namespace != namespace {
+		if namespace != "" && uw.namespace != "" && uw.namespace != namespace {
 			// Namespace mismatch
 			continue
 		}
@@ -269,6 +464,10 @@ func (gw *groupWatcher) startWatchersForRole(role string, aw *apiWatcher) {
 		gw.startWatchersForRole("pod", nil)
 		gw.startWatchersForRole("service", nil)
 	}
+	if gw.attachNodeMetadata && (role == "pod" || role == "endpoints" || role == "endpointslice") {
+		gw.startWatchersForRole("node", nil)
+	}
+
 	paths := getAPIPathsWithNamespaces(role, gw.namespaces, gw.selectors)
 	for _, path := range paths {
 		apiURL := gw.apiServer + path
@@ -286,51 +485,46 @@ func (gw *groupWatcher) startWatchersForRole(role string, aw *apiWatcher) {
 		if needStart {
 			uw.reloadObjects()
 			go uw.watchForUpdates()
-			if role == "endpoints" || role == "endpointslice" {
-				// Refresh endpoints and enpointslices targets in background, since they depend on other object types such as pod and service.
+			if role == "endpoints" || role == "endpointslice" || (gw.attachNodeMetadata && role == "pod") {
+				// Refresh targets in background, since they depend on other object types such as pod, service or node.
+				// This should guarantee that the ScrapeWork objects for these objects are properly updated
+				// as soon as the objects they depend on are updated.
 				// This should fix https://github.com/VictoriaMetrics/VictoriaMetrics/issues/1240 .
-				go func() {
-					for {
-						time.Sleep(5 * time.Second)
-						gw.mu.Lock()
-						uw.reloadScrapeWorksForAPIWatchersLocked(uw.aws)
-						gw.mu.Unlock()
-					}
-				}()
+				go uw.recreateScrapeWorks()
 			}
 		}
 	}
 }
 
 // doRequest performs http request to the given requestURL.
-func (gw *groupWatcher) doRequest(requestURL string) (*http.Response, error) {
-	if strings.Contains(requestURL, "/apis/networking.k8s.io/v1/") && atomic.LoadUint32(&gw.useNetworkingV1Beta1) == 1 {
+func (gw *groupWatcher) doRequest(ctx context.Context, requestURL string) (*http.Response, error) {
+	if strings.Contains(requestURL, "/apis/networking.k8s.io/v1/") && gw.useNetworkingV1Beta1.Load() {
 		// Update networking URL for old Kubernetes API, which supports only v1beta1 path.
 		requestURL = strings.Replace(requestURL, "/apis/networking.k8s.io/v1/", "/apis/networking.k8s.io/v1beta1/", 1)
 	}
-	if strings.Contains(requestURL, "/apis/discovery.k8s.io/v1/") && atomic.LoadUint32(&gw.useDiscoveryV1Beta1) == 1 {
-		// Update discovery URL for old Kuberentes API, which supports only v1beta1 path.
+	if strings.Contains(requestURL, "/apis/discovery.k8s.io/v1/") && gw.useDiscoveryV1Beta1.Load() {
+		// Update discovery URL for old Kubernetes API, which supports only v1beta1 path.
 		requestURL = strings.Replace(requestURL, "/apis/discovery.k8s.io/v1/", "/apis/discovery.k8s.io/v1beta1/", 1)
 	}
-	req, err := http.NewRequest("GET", requestURL, nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, requestURL, nil)
 	if err != nil {
-		logger.Fatalf("cannot create a request for %q: %s", requestURL, err)
+		logger.Panicf("FATAL: cannot create a request for %q: %s", requestURL, err)
 	}
-	if ah := gw.getAuthHeader(); ah != "" {
-		req.Header.Set("Authorization", ah)
+	if err := gw.setHeaders(req); err != nil {
+		return nil, fmt.Errorf("cannot set request headers: %w", err)
 	}
 	resp, err := gw.client.Do(req)
 	if err != nil {
 		return nil, err
 	}
 	if resp.StatusCode == http.StatusNotFound {
-		if strings.Contains(requestURL, "/apis/networking.k8s.io/v1/") && atomic.LoadUint32(&gw.useNetworkingV1Beta1) == 0 {
-			atomic.StoreUint32(&gw.useNetworkingV1Beta1, 1)
-			return gw.doRequest(requestURL)
+		if strings.Contains(requestURL, "/apis/networking.k8s.io/v1/") && !gw.useNetworkingV1Beta1.Load() {
+			gw.useNetworkingV1Beta1.Store(true)
+			return gw.doRequest(ctx, requestURL)
 		}
-		if strings.Contains(requestURL, "/apis/discovery.k8s.io/v1/") && atomic.LoadUint32(&gw.useDiscoveryV1Beta1) == 0 {
-			atomic.StoreUint32(&gw.useDiscoveryV1Beta1, 1)
-			return gw.doRequest(requestURL)
+		if strings.Contains(requestURL, "/apis/discovery.k8s.io/v1/") && !gw.useDiscoveryV1Beta1.Load() {
+			gw.useDiscoveryV1Beta1.Store(true)
+			return gw.doRequest(ctx, requestURL)
 		}
 	}
 	return resp, nil
@@ -338,18 +532,18 @@ func (gw *groupWatcher) doRequest(requestURL string) (*http.Response, error) {
 
 func (gw *groupWatcher) registerPendingAPIWatchers() {
 	gw.mu.Lock()
-	defer gw.mu.Unlock()
 	for _, uw := range gw.m {
 		uw.registerPendingAPIWatchersLocked()
 	}
+	gw.mu.Unlock()
 }
 
 func (gw *groupWatcher) unsubscribeAPIWatcher(aw *apiWatcher) {
 	gw.mu.Lock()
-	defer gw.mu.Unlock()
 	for _, uw := range gw.m {
 		uw.unsubscribeAPIWatcherLocked(aw)
 	}
+	gw.mu.Unlock()
 }
 
 // urlWatcher watches for an apiURL and updates object states in objectsByKey.
@@ -368,7 +562,7 @@ type urlWatcher struct {
 	// Batch registering saves CPU time needed for registering big number of Kubernetes objects
 	// shared among big number of scrape jobs, since per-object labels are generated only once
 	// for all the scrape jobs (each scrape job is associated with a single apiWatcher).
-	// See reloadScrapeWorksForAPIWatchersLocked for details.
+	// See registerPendingAPIWatchersLocked for details.
 	awsPending map[*apiWatcher]struct{}
 
 	// aws contains registered apiWatcher objects
@@ -376,6 +570,8 @@ type urlWatcher struct {
 
 	// objectsByKey contains the latest state for objects obtained from apiURL
 	objectsByKey map[string]object
+
+	needRecreateScrapeWorks bool
 
 	resourceVersion string
 
@@ -389,6 +585,7 @@ type urlWatcher struct {
 func newURLWatcher(role, apiURL string, gw *groupWatcher) *urlWatcher {
 	parseObject, parseObjectList := getObjectParsersForRole(role)
 	metrics.GetOrCreateCounter(fmt.Sprintf(`vm_promscrape_discovery_kubernetes_url_watchers{role=%q}`, role)).Inc()
+
 	uw := &urlWatcher{
 		role:   role,
 		apiURL: apiURL,
@@ -411,6 +608,34 @@ func newURLWatcher(role, apiURL string, gw *groupWatcher) *urlWatcher {
 	return uw
 }
 
+func (uw *urlWatcher) recreateScrapeWorks() {
+	minSleepTime := timeutil.AddJitterToDuration(5 * time.Second)
+	sleepTime := minSleepTime
+	gw := uw.gw
+	stopCh := gw.ctx.Done()
+	for {
+		t := timerpool.Get(sleepTime)
+		select {
+		case <-stopCh:
+			timerpool.Put(t)
+			return
+		case <-t.C:
+			timerpool.Put(t)
+		}
+		startTime := time.Now()
+		gw.mu.Lock()
+		if uw.needRecreateScrapeWorks {
+			uw.needRecreateScrapeWorks = false
+			uw.recreateScrapeWorksLocked(uw.objectsByKey, uw.aws)
+			sleepTime = time.Since(startTime)
+			if sleepTime < minSleepTime {
+				sleepTime = minSleepTime
+			}
+		}
+		gw.mu.Unlock()
+	}
+}
+
 func (uw *urlWatcher) subscribeAPIWatcherLocked(aw *apiWatcher) {
 	if _, ok := uw.aws[aw]; !ok {
 		if _, ok := uw.awsPending[aw]; !ok {
@@ -424,15 +649,42 @@ func (uw *urlWatcher) registerPendingAPIWatchersLocked() {
 	if len(uw.awsPending) == 0 {
 		return
 	}
-	awsPending := make([]*apiWatcher, 0, len(uw.awsPending))
+	uw.recreateScrapeWorksLocked(uw.objectsByKey, uw.awsPending)
 	for aw := range uw.awsPending {
-		awsPending = append(awsPending, aw)
 		uw.aws[aw] = struct{}{}
 	}
-	uw.reloadScrapeWorksForAPIWatchersLocked(uw.awsPending)
+	awsPendingLen := len(uw.awsPending)
 	uw.awsPending = make(map[*apiWatcher]struct{})
-	metrics.GetOrCreateCounter(fmt.Sprintf(`vm_promscrape_discovery_kubernetes_subscribers{role=%q,status="working"}`, uw.role)).Add(len(awsPending))
-	metrics.GetOrCreateCounter(fmt.Sprintf(`vm_promscrape_discovery_kubernetes_subscribers{role=%q,status="pending"}`, uw.role)).Add(-len(awsPending))
+	metrics.GetOrCreateCounter(fmt.Sprintf(`vm_promscrape_discovery_kubernetes_subscribers{role=%q,status="working"}`, uw.role)).Add(awsPendingLen)
+	metrics.GetOrCreateCounter(fmt.Sprintf(`vm_promscrape_discovery_kubernetes_subscribers{role=%q,status="pending"}`, uw.role)).Add(-awsPendingLen)
+}
+
+func (uw *urlWatcher) recreateScrapeWorksLocked(objectsByKey map[string]object, awsMap map[*apiWatcher]struct{}) {
+	es := uw.gw.getScrapeWorkObjectsByAPIWatcherLocked(objectsByKey, awsMap)
+	for aw, e := range es {
+		swosByKey := e.swosByKey
+		for key, swos := range swosByKey {
+			if len(swos) == 0 {
+				delete(swosByKey, key)
+			}
+		}
+		aw.replaceScrapeWorks(uw, swosByKey)
+	}
+}
+
+func (uw *urlWatcher) updateScrapeWorksLocked(objectsByKey map[string]object, awsMap map[*apiWatcher]struct{}) {
+	es := uw.gw.getScrapeWorkObjectsByAPIWatcherLocked(objectsByKey, awsMap)
+	for aw, e := range es {
+		aw.updateScrapeWorks(uw, e.swosByKey)
+	}
+}
+
+func (uw *urlWatcher) removeScrapeWorksLocked(keys []string) {
+	for _, key := range keys {
+		for aw := range uw.aws {
+			aw.removeScrapeWorks(uw, key)
+		}
+	}
 }
 
 func (uw *urlWatcher) unsubscribeAPIWatcherLocked(aw *apiWatcher) {
@@ -453,14 +705,24 @@ func (uw *urlWatcher) reloadObjects() string {
 		return uw.resourceVersion
 	}
 
-	requestURL := uw.apiURL
-	resp, err := uw.gw.doRequest(requestURL)
+	gw := uw.gw
+	startTime := time.Now()
+	apiURL := uw.apiURL
+
+	// Set resourceVersion to 0 in order to reduce load on Kubernetes control plane.
+	// See https://kubernetes.io/docs/reference/using-api/api-concepts/#semantics-for-get-and-list
+	// and https://github.com/VictoriaMetrics/VictoriaMetrics/issues/4855 .
+	delimiter := getQueryArgsDelimiter(apiURL)
+	requestURL := apiURL + delimiter + "resourceVersion=0&resourceVersionMatch=NotOlderThan"
+	resp, err := gw.doRequest(gw.ctx, requestURL)
 	if err != nil {
-		logger.Errorf("cannot perform request to %q: %s", requestURL, err)
+		if !errors.Is(err, context.Canceled) {
+			logger.Errorf("cannot perform request to %q: %s", requestURL, err)
+		}
 		return ""
 	}
 	if resp.StatusCode != http.StatusOK {
-		body, _ := ioutil.ReadAll(resp.Body)
+		body, _ := io.ReadAll(resp.Body)
 		_ = resp.Body.Close()
 		logger.Errorf("unexpected status code for request to %q: %d; want %d; response: %q", requestURL, resp.StatusCode, http.StatusOK, body)
 		return ""
@@ -472,113 +734,119 @@ func (uw *urlWatcher) reloadObjects() string {
 		return ""
 	}
 
-	uw.gw.mu.Lock()
-	var updated, removed, added int
-	for key := range uw.objectsByKey {
-		if _, ok := objectsByKey[key]; ok {
-			updated++
+	gw.mu.Lock()
+	objectsAdded := make(map[string]object)
+	objectsUpdated := make(map[string]object)
+	var objectsRemoved []string
+	for key, oPrev := range uw.objectsByKey {
+		o, ok := objectsByKey[key]
+		if ok {
+			if !reflect.DeepEqual(oPrev, o) {
+				objectsUpdated[key] = o
+			}
+			// Overwrite oPrev with o even if these objects are equal.
+			// This should free up memory associated with oPrev.
+			uw.objectsByKey[key] = o
 		} else {
-			removed++
+			objectsRemoved = append(objectsRemoved, key)
+			delete(uw.objectsByKey, key)
 		}
 	}
-	for key := range objectsByKey {
+	for key, o := range objectsByKey {
 		if _, ok := uw.objectsByKey[key]; !ok {
-			added++
+			objectsAdded[key] = o
+			uw.objectsByKey[key] = o
 		}
 	}
-	uw.objectsByKey = objectsByKey
-	uw.reloadScrapeWorksForAPIWatchersLocked(uw.aws)
-	uw.gw.mu.Unlock()
+	uw.removeScrapeWorksLocked(objectsRemoved)
+	uw.updateScrapeWorksLocked(objectsUpdated, uw.aws)
+	uw.updateScrapeWorksLocked(objectsAdded, uw.aws)
+	uw.needRecreateScrapeWorks = false
+	if len(objectsRemoved) > 0 || len(objectsUpdated) > 0 || len(objectsAdded) > 0 {
+		uw.maybeUpdateDependedScrapeWorksLocked()
+	}
+	gw.mu.Unlock()
 
-	uw.objectsUpdated.Add(updated)
-	uw.objectsRemoved.Add(removed)
-	uw.objectsAdded.Add(added)
-	uw.objectsCount.Add(added - removed)
+	uw.objectsUpdated.Add(len(objectsUpdated))
+	uw.objectsRemoved.Add(len(objectsRemoved))
+	uw.objectsAdded.Add(len(objectsAdded))
+	uw.objectsCount.Add(len(objectsAdded) - len(objectsRemoved))
 	uw.resourceVersion = metadata.ResourceVersion
 
-	logger.Infof("reloaded %d objects from %q; updated=%d, removed=%d, added=%d, resourceVersion=%q",
-		len(objectsByKey), requestURL, updated, removed, added, uw.resourceVersion)
+	logger.Infof("reloaded %d objects from %q in %.3fs; updated=%d, removed=%d, added=%d, resourceVersion=%q",
+		len(objectsByKey), requestURL, time.Since(startTime).Seconds(), len(objectsUpdated), len(objectsRemoved), len(objectsAdded), uw.resourceVersion)
 	return uw.resourceVersion
-}
-
-func (uw *urlWatcher) reloadScrapeWorksForAPIWatchersLocked(awsMap map[*apiWatcher]struct{}) {
-	if len(awsMap) == 0 {
-		return
-	}
-	aws := make([]*apiWatcher, 0, len(awsMap))
-	for aw := range awsMap {
-		aws = append(aws, aw)
-	}
-	swosByKey := make([]map[string][]interface{}, len(aws))
-	for i := range aws {
-		swosByKey[i] = make(map[string][]interface{})
-	}
-	for key, o := range uw.objectsByKey {
-		labels := o.getTargetLabels(uw.gw)
-		for i, aw := range aws {
-			swos := aw.getScrapeWorkObjectsForLabels(labels)
-			if len(swos) > 0 {
-				swosByKey[i][key] = swos
-			}
-		}
-	}
-	for i, aw := range aws {
-		aw.reloadScrapeWorks(uw, swosByKey[i])
-	}
 }
 
 // watchForUpdates watches for object updates starting from uw.resourceVersion and updates the corresponding objects to the latest state.
 //
 // See https://kubernetes.io/docs/reference/using-api/api-concepts/#efficient-detection-of-changes
 func (uw *urlWatcher) watchForUpdates() {
-	backoffDelay := time.Second
-	maxBackoffDelay := 30 * time.Second
+	gw := uw.gw
+	stopCh := gw.ctx.Done()
+	minBackoffDelay := timeutil.AddJitterToDuration(time.Second)
+	maxBackoffDelay := timeutil.AddJitterToDuration(time.Second * 30)
+	backoffDelay := minBackoffDelay
 	backoffSleep := func() {
-		time.Sleep(backoffDelay)
+		t := timerpool.Get(backoffDelay)
+		select {
+		case <-stopCh:
+			timerpool.Put(t)
+			return
+		case <-t.C:
+			timerpool.Put(t)
+		}
 		backoffDelay *= 2
 		if backoffDelay > maxBackoffDelay {
 			backoffDelay = maxBackoffDelay
 		}
 	}
 	apiURL := uw.apiURL
-	delimiter := "?"
-	if strings.Contains(apiURL, "?") {
-		delimiter = "&"
-	}
-	timeoutSeconds := time.Duration(0.9 * float64(uw.gw.client.Timeout)).Seconds()
+	delimiter := getQueryArgsDelimiter(apiURL)
+	timeoutSeconds := time.Duration(0.9 * float64(gw.client.Timeout)).Seconds()
 	apiURL += delimiter + "watch=1&allowWatchBookmarks=true&timeoutSeconds=" + strconv.Itoa(int(timeoutSeconds))
 	for {
+		select {
+		case <-stopCh:
+			metrics.GetOrCreateCounter(fmt.Sprintf(`vm_promscrape_discovery_kubernetes_url_watchers{role=%q}`, uw.role)).Dec()
+			logger.Infof("stopped %s watcher for %q", uw.role, uw.apiURL)
+			return
+		default:
+		}
+
 		resourceVersion := uw.reloadObjects()
 		if resourceVersion == "" {
 			backoffSleep()
 			continue
 		}
 		requestURL := apiURL + "&resourceVersion=" + url.QueryEscape(resourceVersion)
-		resp, err := uw.gw.doRequest(requestURL)
+		resp, err := gw.doRequest(gw.ctx, requestURL)
 		if err != nil {
-			logger.Errorf("cannot perform request to %q: %s", requestURL, err)
-			backoffSleep()
+			if !errors.Is(err, context.Canceled) {
+				logger.Errorf("cannot perform request to %q: %s", requestURL, err)
+				backoffSleep()
+			}
 			continue
 		}
 		if resp.StatusCode != http.StatusOK {
 			if resp.StatusCode == 410 {
 				// There is no need for sleep on 410 error. See https://kubernetes.io/docs/reference/using-api/api-concepts/#410-gone-responses
-				backoffDelay = time.Second
+				backoffDelay = minBackoffDelay
 				uw.staleResourceVersions.Inc()
 				uw.resourceVersion = ""
 			} else {
-				body, _ := ioutil.ReadAll(resp.Body)
+				body, _ := io.ReadAll(resp.Body)
 				_ = resp.Body.Close()
 				logger.Errorf("unexpected status code for request to %q: %d; want %d; response: %q", requestURL, resp.StatusCode, http.StatusOK, body)
 				backoffSleep()
 			}
 			continue
 		}
-		backoffDelay = time.Second
+		backoffDelay = minBackoffDelay
 		err = uw.readObjectUpdateStream(resp.Body)
 		_ = resp.Body.Close()
 		if err != nil {
-			if !errors.Is(err, io.EOF) {
+			if !errors.Is(err, io.EOF) && !errors.Is(err, context.Canceled) {
 				logger.Errorf("error when reading WatchEvent stream from %q: %s", requestURL, err)
 				uw.resourceVersion = ""
 			}
@@ -588,13 +856,14 @@ func (uw *urlWatcher) watchForUpdates() {
 	}
 }
 
-// readObjectUpdateStream reads Kuberntes watch events from r and updates locally cached objects according to the received events.
+// readObjectUpdateStream reads Kubernetes watch events from r and updates locally cached objects according to the received events.
 func (uw *urlWatcher) readObjectUpdateStream(r io.Reader) error {
+	gw := uw.gw
 	d := json.NewDecoder(r)
 	var we WatchEvent
 	for {
 		if err := d.Decode(&we); err != nil {
-			return err
+			return fmt.Errorf("cannot parse WatchEvent json response: %w", err)
 		}
 		switch we.Type {
 		case "ADDED", "MODIFIED":
@@ -603,39 +872,18 @@ func (uw *urlWatcher) readObjectUpdateStream(r io.Reader) error {
 				return fmt.Errorf("cannot parse %s object: %w", we.Type, err)
 			}
 			key := o.key()
-			uw.gw.mu.Lock()
-			if _, ok := uw.objectsByKey[key]; !ok {
-				// if we.Type == "MODIFIED" is expected condition after recovering from the bookmarked resourceVersion.
-				uw.objectsCount.Inc()
-				uw.objectsAdded.Inc()
-			} else {
-				// if we.Type == "ADDED" is expected condition after recovering from the bookmarked resourceVersion.
-				uw.objectsUpdated.Inc()
-			}
-			uw.objectsByKey[key] = o
-			if len(uw.aws) > 0 {
-				labels := o.getTargetLabels(uw.gw)
-				for aw := range uw.aws {
-					aw.setScrapeWorks(uw, key, labels)
-				}
-			}
-			uw.gw.mu.Unlock()
+			gw.mu.Lock()
+			uw.updateObjectLocked(key, o)
+			gw.mu.Unlock()
 		case "DELETED":
 			o, err := uw.parseObject(we.Object)
 			if err != nil {
 				return fmt.Errorf("cannot parse %s object: %w", we.Type, err)
 			}
 			key := o.key()
-			uw.gw.mu.Lock()
-			if _, ok := uw.objectsByKey[key]; ok {
-				uw.objectsCount.Dec()
-				uw.objectsRemoved.Inc()
-				delete(uw.objectsByKey, key)
-			}
-			for aw := range uw.aws {
-				aw.removeScrapeWorks(uw, key)
-			}
-			uw.gw.mu.Unlock()
+			gw.mu.Lock()
+			uw.removeObjectLocked(key)
+			gw.mu.Unlock()
 		case "BOOKMARK":
 			// See https://kubernetes.io/docs/reference/using-api/api-concepts/#watch-bookmarks
 			bm, err := parseBookmark(we.Object)
@@ -661,12 +909,79 @@ func (uw *urlWatcher) readObjectUpdateStream(r io.Reader) error {
 	}
 }
 
+func (uw *urlWatcher) updateObjectLocked(key string, o object) {
+	oPrev, ok := uw.objectsByKey[key]
+	// Overwrite oPrev with o even if these objects are equal.
+	// This should free up memory associated with oPrev.
+	uw.objectsByKey[key] = o
+	if !ok {
+		uw.objectsCount.Inc()
+		uw.objectsAdded.Inc()
+	} else {
+		if reflect.DeepEqual(oPrev, o) {
+			// Nothing to do, since the new object is equal to the previous one.
+			return
+		}
+		uw.objectsUpdated.Inc()
+	}
+	if len(uw.aws) > 0 {
+		labelss := o.getTargetLabels(uw.gw)
+		for aw := range uw.aws {
+			aw.setScrapeWorks(uw, key, labelss)
+		}
+		putLabelssToPool(labelss)
+	}
+	uw.maybeUpdateDependedScrapeWorksLocked()
+}
+
+func (uw *urlWatcher) removeObjectLocked(key string) {
+	if _, ok := uw.objectsByKey[key]; !ok {
+		return
+	}
+	uw.objectsCount.Dec()
+	uw.objectsRemoved.Inc()
+	delete(uw.objectsByKey, key)
+	for aw := range uw.aws {
+		aw.removeScrapeWorks(uw, key)
+	}
+	uw.maybeUpdateDependedScrapeWorksLocked()
+}
+
+func (uw *urlWatcher) maybeUpdateDependedScrapeWorksLocked() {
+	role := uw.role
+	attachNodeMetadata := uw.gw.attachNodeMetadata
+	if !(role == "pod" || role == "service" || (attachNodeMetadata && role == "node")) {
+		// Nothing to update
+		return
+	}
+	namespace := uw.namespace
+	for _, uwx := range uw.gw.m {
+		if namespace != "" && uwx.namespace != "" && uwx.namespace != namespace {
+			// Namespace mismatch
+			continue
+		}
+		if (role == "pod" || role == "service") && (uwx.role == "endpoints" || uwx.role == "endpointslice") {
+			// endpoints and endpointslice objects depend on pods and service objects
+			uwx.needRecreateScrapeWorks = true
+			continue
+		}
+		if attachNodeMetadata && role == "node" && (uwx.role == "pod" || uwx.role == "endpoints" || uwx.role == "endpointslice") {
+			// pod, endpoints and enpointslices objects depend on node objects if attachNodeMetadata is set
+			uwx.needRecreateScrapeWorks = true
+			continue
+		}
+	}
+}
+
 // Bookmark is a bookmark message from Kubernetes Watch API.
 // See https://kubernetes.io/docs/reference/using-api/api-concepts/#watch-bookmarks
 type Bookmark struct {
-	Metadata struct {
-		ResourceVersion string
-	}
+	Metadata BookmarkMetadata
+}
+
+// BookmarkMetadata is metadata for Bookmark
+type BookmarkMetadata struct {
+	ResourceVersion string
 }
 
 func parseBookmark(data []byte) (*Bookmark, error) {
@@ -783,4 +1098,11 @@ func getObjectParsersForRole(role string) (parseObjectFunc, parseObjectListFunc)
 		logger.Panicf("BUG: unsupported role=%q", role)
 		return nil, nil
 	}
+}
+
+func getQueryArgsDelimiter(apiURL string) string {
+	if strings.Contains(apiURL, "?") {
+		return "&"
+	}
+	return "?"
 }

@@ -5,55 +5,115 @@ import (
 	"fmt"
 	"math"
 	"net/http"
-	"sort"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
-	"github.com/VictoriaMetrics/VictoriaMetrics/app/vmselect/bufferedwriter"
+	"github.com/VictoriaMetrics/metrics"
+	"github.com/VictoriaMetrics/metricsql"
+	"github.com/valyala/fastjson/fastfloat"
+
 	"github.com/VictoriaMetrics/VictoriaMetrics/app/vmselect/netstorage"
 	"github.com/VictoriaMetrics/VictoriaMetrics/app/vmselect/promql"
 	"github.com/VictoriaMetrics/VictoriaMetrics/app/vmselect/querystats"
 	"github.com/VictoriaMetrics/VictoriaMetrics/app/vmselect/searchutils"
+	"github.com/VictoriaMetrics/VictoriaMetrics/lib/bufferedwriter"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/bytesutil"
-	"github.com/VictoriaMetrics/VictoriaMetrics/lib/cgroup"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/encoding"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/fasttime"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/flagutil"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/httpserver"
+	"github.com/VictoriaMetrics/VictoriaMetrics/lib/httputils"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/logger"
+	"github.com/VictoriaMetrics/VictoriaMetrics/lib/memory"
+	"github.com/VictoriaMetrics/VictoriaMetrics/lib/netutil"
+	"github.com/VictoriaMetrics/VictoriaMetrics/lib/querytracer"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/storage"
-	"github.com/VictoriaMetrics/metrics"
-	"github.com/valyala/fastjson/fastfloat"
-	"github.com/valyala/quicktemplate"
 )
 
 var (
 	latencyOffset = flag.Duration("search.latencyOffset", time.Second*30, "The time when data points become visible in query results after the collection. "+
+		"It can be overridden on per-query basis via latency_offset arg. "+
 		"Too small value can result in incomplete last points for query results")
 	maxQueryLen = flagutil.NewBytes("search.maxQueryLen", 16*1024, "The maximum search query length in bytes")
-	maxLookback = flag.Duration("search.maxLookback", 0, "Synonym to -search.lookback-delta from Prometheus. "+
+	maxLookback = flag.Duration("search.maxLookback", 0, "Synonym to -query.lookback-delta from Prometheus. "+
 		"The value is dynamically detected from interval between time series datapoints if not set. It can be overridden on per-query basis via max_lookback arg. "+
-		"See also '-search.maxStalenessInterval' flag, which has the same meaining due to historical reasons")
+		"See also '-search.maxStalenessInterval' flag, which has the same meaning due to historical reasons")
 	maxStalenessInterval = flag.Duration("search.maxStalenessInterval", 0, "The maximum interval for staleness calculations. "+
-		"By default it is automatically calculated from the median interval between samples. This flag could be useful for tuning "+
+		"By default, it is automatically calculated from the median interval between samples. This flag could be useful for tuning "+
 		"Prometheus data model closer to Influx-style data model. See https://prometheus.io/docs/prometheus/latest/querying/basics/#staleness for details. "+
-		"See also '-search.maxLookback' flag, which has the same meaning due to historical reasons")
+		"See also '-search.setLookbackToStep' flag")
+	setLookbackToStep = flag.Bool("search.setLookbackToStep", false, "Whether to fix lookback interval to 'step' query arg value. "+
+		"If set to true, the query model becomes closer to InfluxDB data model. If set to true, then -search.maxLookback and -search.maxStalenessInterval are ignored")
 	maxStepForPointsAdjustment = flag.Duration("search.maxStepForPointsAdjustment", time.Minute, "The maximum step when /api/v1/query_range handler adjusts "+
 		"points with timestamps closer than -search.latencyOffset to the current time. The adjustment is needed because such points may contain incomplete data")
+
+	maxUniqueTimeseries = flag.Int("search.maxUniqueTimeseries", 0, "The maximum number of unique time series, which can be selected during /api/v1/query and /api/v1/query_range queries. This option allows limiting memory usage. "+
+		"When set to zero, the limit is automatically calculated based on -search.maxConcurrentRequests (inversely proportional) and memory available to the process (proportional).")
+	maxFederateSeries   = flag.Int("search.maxFederateSeries", 1e6, "The maximum number of time series, which can be returned from /federate. This option allows limiting memory usage")
+	maxExportSeries     = flag.Int("search.maxExportSeries", 10e6, "The maximum number of time series, which can be returned from /api/v1/export* APIs. This option allows limiting memory usage")
+	maxTSDBStatusSeries = flag.Int("search.maxTSDBStatusSeries", 10e6, "The maximum number of time series, which can be processed during the call to /api/v1/status/tsdb. This option allows limiting memory usage")
+	maxSeriesLimit      = flag.Int("search.maxSeries", 30e3, "The maximum number of time series, which can be returned from /api/v1/series. This option allows limiting memory usage")
+	maxDeleteSeries     = flag.Int("search.maxDeleteSeries", 1e6, "The maximum number of time series, which can be deleted using /api/v1/admin/tsdb/delete_series. This option allows limiting memory usage")
+	maxLabelsAPISeries  = flag.Int("search.maxLabelsAPISeries", 1e6, "The maximum number of time series, which could be scanned when searching for the matching time series "+
+		"at /api/v1/labels and /api/v1/label/.../values. This option allows limiting memory usage and CPU usage. See also -search.maxLabelsAPIDuration, "+
+		"-search.maxTagKeys, -search.maxTagValues and -search.ignoreExtraFiltersAtLabelsAPI")
+	maxPointsPerTimeseries = flag.Int("search.maxPointsPerTimeseries", 30e3, "The maximum points per a single timeseries returned from /api/v1/query_range. "+
+		"This option doesn't limit the number of scanned raw samples in the database. The main purpose of this option is to limit the number of per-series points "+
+		"returned to graphing UI such as VMUI or Grafana. There is no sense in setting this limit to values bigger than the horizontal resolution of the graph. "+
+		"See also -search.maxResponseSeries")
+	ignoreExtraFiltersAtLabelsAPI = flag.Bool("search.ignoreExtraFiltersAtLabelsAPI", false, "Whether to ignore match[], extra_filters[] and extra_label query args at "+
+		"/api/v1/labels and /api/v1/label/.../values . This may be useful for decreasing load on VictoriaMetrics when extra filters "+
+		"match too many time series. The downside is that superfluous labels or series could be returned, which do not match the extra filters. "+
+		"See also -search.maxLabelsAPISeries and -search.maxLabelsAPIDuration")
 )
 
 // Default step used if not set.
 const defaultStep = 5 * 60 * 1000
 
+// ExpandWithExprs handles the request to /expand-with-exprs
+func ExpandWithExprs(w http.ResponseWriter, r *http.Request) {
+	query := r.FormValue("query")
+	format := r.FormValue("format")
+	bw := bufferedwriter.Get(w)
+	defer bufferedwriter.Put(bw)
+	if format == "json" {
+		w.Header().Set("Content-Type", "application/json")
+		httpserver.EnableCORS(w, r)
+		WriteExpandWithExprsJSONResponse(bw, query)
+	} else {
+		WriteExpandWithExprsResponse(bw, query)
+	}
+	_ = bw.Flush()
+}
+
+// PrettifyQuery handles the request /prettify-query
+func PrettifyQuery(w http.ResponseWriter, r *http.Request) {
+	query := r.FormValue("query")
+	bw := bufferedwriter.Get(w)
+	defer bufferedwriter.Put(bw)
+	w.Header().Set("Content-Type", "application/json")
+	httpserver.EnableCORS(w, r)
+
+	prettyQuery, err := metricsql.Prettify(query)
+	if err != nil {
+		fmt.Fprintf(bw, `{"status": "error", "msg": %q}`, err)
+	} else {
+		fmt.Fprintf(bw, `{"status": "success", "query": %q}`, prettyQuery)
+	}
+	_ = bw.Flush()
+}
+
 // FederateHandler implements /federate . See https://prometheus.io/docs/prometheus/latest/federation/
 func FederateHandler(startTime time.Time, w http.ResponseWriter, r *http.Request) error {
 	defer federateDuration.UpdateDuration(startTime)
 
-	ct := startTime.UnixNano() / 1e6
-	if err := r.ParseForm(); err != nil {
-		return fmt.Errorf("cannot parse request form values: %w", err)
+	cp, err := getCommonParams(r, startTime, true)
+	if err != nil {
+		return err
 	}
 	lookbackDelta, err := getMaxLookback(r)
 	if err != nil {
@@ -62,24 +122,11 @@ func FederateHandler(startTime time.Time, w http.ResponseWriter, r *http.Request
 	if lookbackDelta <= 0 {
 		lookbackDelta = defaultStep
 	}
-	start, err := searchutils.GetTime(r, "start", ct-lookbackDelta)
-	if err != nil {
-		return err
+	if cp.IsDefaultTimeRange() {
+		cp.start = cp.end - lookbackDelta
 	}
-	end, err := searchutils.GetTime(r, "end", ct)
-	if err != nil {
-		return err
-	}
-	deadline := searchutils.GetDeadlineForQuery(r, startTime)
-	if start >= end {
-		start = end - defaultStep
-	}
-	tagFilterss, err := getTagFilterssFromRequest(r)
-	if err != nil {
-		return err
-	}
-	sq := storage.NewSearchQuery(start, end, tagFilterss)
-	rss, err := netstorage.ProcessSearchQuery(sq, true, deadline)
+	sq := storage.NewSearchQuery(cp.start, cp.end, cp.filterss, *maxFederateSeries)
+	rss, err := netstorage.ProcessSearchQuery(nil, sq, cp.deadline)
 	if err != nil {
 		return fmt.Errorf("cannot fetch data for %q: %w", sq, err)
 	}
@@ -87,21 +134,20 @@ func FederateHandler(startTime time.Time, w http.ResponseWriter, r *http.Request
 	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 	bw := bufferedwriter.Get(w)
 	defer bufferedwriter.Put(bw)
-	err = rss.RunParallel(func(rs *netstorage.Result, workerID uint) error {
+	sw := newScalableWriter(bw)
+	err = rss.RunParallel(nil, func(rs *netstorage.Result, workerID uint) error {
 		if err := bw.Error(); err != nil {
 			return err
 		}
-		bb := quicktemplate.AcquireByteBuffer()
+		bb := sw.getBuffer(workerID)
 		WriteFederate(bb, rs)
-		_, err := bw.Write(bb.B)
-		quicktemplate.ReleaseByteBuffer(bb)
-		return err
+		return sw.maybeFlushBuffer(bb)
 	})
-	if err != nil {
-		return fmt.Errorf("error during sending data to remote client: %w", err)
+	if err == nil {
+		err = sw.flush()
 	}
-	if err := bw.Flush(); err != nil {
-		return err
+	if err != nil && !netutil.IsTrivialNetworkError(err) {
+		return fmt.Errorf("error during sending data to remote client: %w", err)
 	}
 	return nil
 }
@@ -112,69 +158,82 @@ var federateDuration = metrics.NewSummary(`vm_request_duration_seconds{path="/fe
 func ExportCSVHandler(startTime time.Time, w http.ResponseWriter, r *http.Request) error {
 	defer exportCSVDuration.UpdateDuration(startTime)
 
-	ct := startTime.UnixNano() / 1e6
-	if err := r.ParseForm(); err != nil {
-		return fmt.Errorf("cannot parse request form values: %w", err)
+	cp, err := getExportParams(r, startTime)
+	if err != nil {
+		return err
 	}
+
 	format := r.FormValue("format")
 	if len(format) == 0 {
 		return fmt.Errorf("missing `format` arg; see https://docs.victoriametrics.com/#how-to-export-csv-data")
 	}
 	fieldNames := strings.Split(format, ",")
-	start, err := searchutils.GetTime(r, "start", 0)
-	if err != nil {
-		return err
-	}
-	end, err := searchutils.GetTime(r, "end", ct)
-	if err != nil {
-		return err
-	}
-	deadline := searchutils.GetDeadlineForExport(r, startTime)
-	tagFilterss, err := getTagFilterssFromRequest(r)
-	if err != nil {
-		return err
-	}
-	sq := storage.NewSearchQuery(start, end, tagFilterss)
+	reduceMemUsage := httputils.GetBool(r, "reduce_mem_usage")
+
+	sq := storage.NewSearchQuery(cp.start, cp.end, cp.filterss, *maxExportSeries)
 	w.Header().Set("Content-Type", "text/csv; charset=utf-8")
 	bw := bufferedwriter.Get(w)
 	defer bufferedwriter.Put(bw)
-
-	resultsCh := make(chan *quicktemplate.ByteBuffer, cgroup.AvailableCPUs())
-	doneCh := make(chan error)
-	go func() {
-		err := netstorage.ExportBlocks(sq, deadline, func(mn *storage.MetricName, b *storage.Block, tr storage.TimeRange) error {
-			if err := bw.Error(); err != nil {
-				return err
-			}
-			if err := b.UnmarshalData(); err != nil {
-				return fmt.Errorf("cannot unmarshal block during export: %s", err)
-			}
-			xb := exportBlockPool.Get().(*exportBlock)
-			xb.mn = mn
-			xb.timestamps, xb.values = b.AppendRowsWithTimeRangeFilter(xb.timestamps[:0], xb.values[:0], tr)
-			if len(xb.timestamps) > 0 {
-				bb := quicktemplate.AcquireByteBuffer()
-				WriteExportCSVLine(bb, xb, fieldNames)
-				resultsCh <- bb
-			}
-			xb.reset()
-			exportBlockPool.Put(xb)
+	sw := newScalableWriter(bw)
+	writeCSVLine := func(xb *exportBlock, workerID uint) error {
+		if len(xb.timestamps) == 0 {
 			return nil
-		})
-		close(resultsCh)
-		doneCh <- err
-	}()
-	// Consume all the data from resultsCh.
-	for bb := range resultsCh {
-		// Do not check for error in bw.Write, since this error is checked inside netstorage.ExportBlocks above.
-		_, _ = bw.Write(bb.B)
-		quicktemplate.ReleaseByteBuffer(bb)
+		}
+		bb := sw.getBuffer(workerID)
+		WriteExportCSVLine(bb, xb, fieldNames)
+		return sw.maybeFlushBuffer(bb)
 	}
-	if err := bw.Flush(); err != nil {
-		return err
+	doneCh := make(chan error, 1)
+	if !reduceMemUsage {
+		rss, err := netstorage.ProcessSearchQuery(nil, sq, cp.deadline)
+		if err != nil {
+			return fmt.Errorf("cannot fetch data for %q: %w", sq, err)
+		}
+		go func() {
+			err := rss.RunParallel(nil, func(rs *netstorage.Result, workerID uint) error {
+				if err := bw.Error(); err != nil {
+					return err
+				}
+				xb := exportBlockPool.Get().(*exportBlock)
+				xb.mn = &rs.MetricName
+				xb.timestamps = rs.Timestamps
+				xb.values = rs.Values
+				if err := writeCSVLine(xb, workerID); err != nil {
+					return err
+				}
+				xb.reset()
+				exportBlockPool.Put(xb)
+				return nil
+			})
+			doneCh <- err
+		}()
+	} else {
+		go func() {
+			err := netstorage.ExportBlocks(nil, sq, cp.deadline, func(mn *storage.MetricName, b *storage.Block, tr storage.TimeRange, workerID uint) error {
+				if err := bw.Error(); err != nil {
+					return err
+				}
+				if err := b.UnmarshalData(); err != nil {
+					return fmt.Errorf("cannot unmarshal block during export: %w", err)
+				}
+				xb := exportBlockPool.Get().(*exportBlock)
+				xb.mn = mn
+				xb.timestamps, xb.values = b.AppendRowsWithTimeRangeFilter(xb.timestamps[:0], xb.values[:0], tr)
+				if err := writeCSVLine(xb, workerID); err != nil {
+					return err
+				}
+				xb.reset()
+				exportBlockPool.Put(xb)
+				return nil
+			})
+			doneCh <- err
+		}()
 	}
 	err = <-doneCh
-	if err != nil {
+	if err == nil {
+		err = sw.flush()
+	}
+	if err != nil && !netutil.IsTrivialNetworkError(err) {
 		return fmt.Errorf("error during sending the exported csv data to remote client: %w", err)
 	}
 	return nil
@@ -186,42 +245,31 @@ var exportCSVDuration = metrics.NewSummary(`vm_request_duration_seconds{path="/a
 func ExportNativeHandler(startTime time.Time, w http.ResponseWriter, r *http.Request) error {
 	defer exportNativeDuration.UpdateDuration(startTime)
 
-	ct := startTime.UnixNano() / 1e6
-	if err := r.ParseForm(); err != nil {
-		return fmt.Errorf("cannot parse request form values: %w", err)
-	}
-	start, err := searchutils.GetTime(r, "start", 0)
+	cp, err := getExportParams(r, startTime)
 	if err != nil {
 		return err
 	}
-	end, err := searchutils.GetTime(r, "end", ct)
-	if err != nil {
-		return err
-	}
-	deadline := searchutils.GetDeadlineForExport(r, startTime)
-	tagFilterss, err := getTagFilterssFromRequest(r)
-	if err != nil {
-		return err
-	}
-	sq := storage.NewSearchQuery(start, end, tagFilterss)
+
+	sq := storage.NewSearchQuery(cp.start, cp.end, cp.filterss, *maxExportSeries)
 	w.Header().Set("Content-Type", "VictoriaMetrics/native")
 	bw := bufferedwriter.Get(w)
 	defer bufferedwriter.Put(bw)
+	sw := newScalableWriter(bw)
 
 	// Marshal tr
 	trBuf := make([]byte, 0, 16)
-	trBuf = encoding.MarshalInt64(trBuf, start)
-	trBuf = encoding.MarshalInt64(trBuf, end)
+	trBuf = encoding.MarshalInt64(trBuf, cp.start)
+	trBuf = encoding.MarshalInt64(trBuf, cp.end)
 	_, _ = bw.Write(trBuf)
 
 	// Marshal native blocks.
-	err = netstorage.ExportBlocks(sq, deadline, func(mn *storage.MetricName, b *storage.Block, tr storage.TimeRange) error {
+	err = netstorage.ExportBlocks(nil, sq, cp.deadline, func(mn *storage.MetricName, b *storage.Block, _ storage.TimeRange, workerID uint) error {
 		if err := bw.Error(); err != nil {
 			return err
 		}
-		dstBuf := bbPool.Get()
+		bb := sw.getBuffer(workerID)
+		dst := bb.B
 		tmpBuf := bbPool.Get()
-		dst := dstBuf.B
 		tmp := tmpBuf.B
 
 		// Marshal mn
@@ -237,17 +285,14 @@ func ExportNativeHandler(startTime time.Time, w http.ResponseWriter, r *http.Req
 		tmpBuf.B = tmp
 		bbPool.Put(tmpBuf)
 
-		_, err := bw.Write(dst)
-
-		dstBuf.B = dst
-		bbPool.Put(dstBuf)
-		return err
+		bb.B = dst
+		return sw.maybeFlushBuffer(bb)
 	})
-	if err != nil {
-		return fmt.Errorf("error during sending native data to remote client: %w", err)
+	if err == nil {
+		err = sw.flush()
 	}
-	if err := bw.Flush(); err != nil {
-		return fmt.Errorf("error during flushing native data to remote client: %w", err)
+	if err != nil && !netutil.IsTrivialNetworkError(err) {
+		return fmt.Errorf("error during sending native data to remote client: %w", err)
 	}
 	return nil
 }
@@ -260,67 +305,66 @@ var bbPool bytesutil.ByteBufferPool
 func ExportHandler(startTime time.Time, w http.ResponseWriter, r *http.Request) error {
 	defer exportDuration.UpdateDuration(startTime)
 
-	ct := startTime.UnixNano() / 1e6
-	if err := r.ParseForm(); err != nil {
-		return fmt.Errorf("cannot parse request form values: %w", err)
-	}
-	matches := getMatchesFromRequest(r)
-	if len(matches) == 0 {
-		return fmt.Errorf("missing `match[]` query arg")
-	}
-	start, err := searchutils.GetTime(r, "start", 0)
-	if err != nil {
-		return err
-	}
-	end, err := searchutils.GetTime(r, "end", ct)
+	cp, err := getExportParams(r, startTime)
 	if err != nil {
 		return err
 	}
 	format := r.FormValue("format")
 	maxRowsPerLine := int(fastfloat.ParseInt64BestEffort(r.FormValue("max_rows_per_line")))
-	reduceMemUsage := searchutils.GetBool(r, "reduce_mem_usage")
-	deadline := searchutils.GetDeadlineForExport(r, startTime)
-	if start >= end {
-		end = start + defaultStep
-	}
-	etf, err := searchutils.GetEnforcedTagFiltersFromRequest(r)
-	if err != nil {
-		return err
-	}
-	if err := exportHandler(w, matches, etf, start, end, format, maxRowsPerLine, reduceMemUsage, deadline); err != nil {
-		return fmt.Errorf("error when exporting data for queries=%q on the time range (start=%d, end=%d): %w", matches, start, end, err)
+	reduceMemUsage := httputils.GetBool(r, "reduce_mem_usage")
+	if err := exportHandler(nil, w, cp, format, maxRowsPerLine, reduceMemUsage); err != nil {
+		return fmt.Errorf("error when exporting data on the time range (start=%d, end=%d): %w", cp.start, cp.end, err)
 	}
 	return nil
 }
 
 var exportDuration = metrics.NewSummary(`vm_request_duration_seconds{path="/api/v1/export"}`)
 
-func exportHandler(w http.ResponseWriter, matches []string, etf []storage.TagFilter, start, end int64, format string, maxRowsPerLine int, reduceMemUsage bool, deadline searchutils.Deadline) error {
-	writeResponseFunc := WriteExportStdResponse
-	writeLineFunc := func(xb *exportBlock, resultsCh chan<- *quicktemplate.ByteBuffer) {
-		bb := quicktemplate.AcquireByteBuffer()
+func exportHandler(qt *querytracer.Tracer, w http.ResponseWriter, cp *commonParams, format string, maxRowsPerLine int, reduceMemUsage bool) error {
+	bw := bufferedwriter.Get(w)
+	defer bufferedwriter.Put(bw)
+	sw := newScalableWriter(bw)
+	writeLineFunc := func(xb *exportBlock, workerID uint) error {
+		bb := sw.getBuffer(workerID)
 		WriteExportJSONLine(bb, xb)
-		resultsCh <- bb
+		return sw.maybeFlushBuffer(bb)
 	}
 	contentType := "application/stream+json; charset=utf-8"
 	if format == "prometheus" {
 		contentType = "text/plain; charset=utf-8"
-		writeLineFunc = func(xb *exportBlock, resultsCh chan<- *quicktemplate.ByteBuffer) {
-			bb := quicktemplate.AcquireByteBuffer()
+		writeLineFunc = func(xb *exportBlock, workerID uint) error {
+			bb := sw.getBuffer(workerID)
 			WriteExportPrometheusLine(bb, xb)
-			resultsCh <- bb
+			return sw.maybeFlushBuffer(bb)
 		}
 	} else if format == "promapi" {
-		writeResponseFunc = WriteExportPromAPIResponse
-		writeLineFunc = func(xb *exportBlock, resultsCh chan<- *quicktemplate.ByteBuffer) {
-			bb := quicktemplate.AcquireByteBuffer()
+		WriteExportPromAPIHeader(bw)
+		var firstLineOnce atomic.Bool
+		var firstLineSent atomic.Bool
+		writeLineFunc = func(xb *exportBlock, workerID uint) error {
+			bb := sw.getBuffer(workerID)
+			// Use Load() in front of CompareAndSwap() in order to avoid slow inter-CPU synchronization
+			// in fast path after the first line has been already sent.
+			if !firstLineOnce.Load() && firstLineOnce.CompareAndSwap(false, true) {
+				// Send the first line to sw.bw
+				WriteExportPromAPILine(bb, xb)
+				_, err := sw.bw.Write(bb.B)
+				bb.Reset()
+				firstLineSent.Store(true)
+				return err
+			}
+			for !firstLineSent.Load() {
+				// Busy wait until the first line is sent to sw.bw
+				runtime.Gosched()
+			}
+			bb.B = append(bb.B, ',')
 			WriteExportPromAPILine(bb, xb)
-			resultsCh <- bb
+			return sw.maybeFlushBuffer(bb)
 		}
 	}
 	if maxRowsPerLine > 0 {
 		writeLineFuncOrig := writeLineFunc
-		writeLineFunc = func(xb *exportBlock, resultsCh chan<- *quicktemplate.ByteBuffer) {
+		writeLineFunc = func(xb *exportBlock, workerID uint) error {
 			valuesOrig := xb.values
 			timestampsOrig := xb.timestamps
 			values := valuesOrig
@@ -341,33 +385,28 @@ func exportHandler(w http.ResponseWriter, matches []string, etf []storage.TagFil
 				}
 				xb.values = valuesChunk
 				xb.timestamps = timestampsChunk
-				writeLineFuncOrig(xb, resultsCh)
+				if err := writeLineFuncOrig(xb, workerID); err != nil {
+					return err
+				}
 			}
 			xb.values = valuesOrig
 			xb.timestamps = timestampsOrig
+			return nil
 		}
 	}
 
-	tagFilterss, err := getTagFilterssFromMatches(matches)
-	if err != nil {
-		return err
-	}
-	tagFilterss = addEnforcedFiltersToTagFilterss(tagFilterss, etf)
-
-	sq := storage.NewSearchQuery(start, end, tagFilterss)
+	sq := storage.NewSearchQuery(cp.start, cp.end, cp.filterss, *maxExportSeries)
 	w.Header().Set("Content-Type", contentType)
-	bw := bufferedwriter.Get(w)
-	defer bufferedwriter.Put(bw)
 
-	resultsCh := make(chan *quicktemplate.ByteBuffer, cgroup.AvailableCPUs())
-	doneCh := make(chan error)
+	doneCh := make(chan error, 1)
 	if !reduceMemUsage {
-		rss, err := netstorage.ProcessSearchQuery(sq, true, deadline)
+		rss, err := netstorage.ProcessSearchQuery(qt, sq, cp.deadline)
 		if err != nil {
 			return fmt.Errorf("cannot fetch data for %q: %w", sq, err)
 		}
+		qtChild := qt.NewChild("background export format=%s", format)
 		go func() {
-			err := rss.RunParallel(func(rs *netstorage.Result, workerID uint) error {
+			err := rss.RunParallel(qtChild, func(rs *netstorage.Result, workerID uint) error {
 				if err := bw.Error(); err != nil {
 					return err
 				}
@@ -375,46 +414,54 @@ func exportHandler(w http.ResponseWriter, matches []string, etf []storage.TagFil
 				xb.mn = &rs.MetricName
 				xb.timestamps = rs.Timestamps
 				xb.values = rs.Values
-				writeLineFunc(xb, resultsCh)
+				if err := writeLineFunc(xb, workerID); err != nil {
+					return err
+				}
 				xb.reset()
 				exportBlockPool.Put(xb)
 				return nil
 			})
-			close(resultsCh)
+			qtChild.Done()
 			doneCh <- err
 		}()
 	} else {
+		qtChild := qt.NewChild("background export format=%s", format)
 		go func() {
-			err := netstorage.ExportBlocks(sq, deadline, func(mn *storage.MetricName, b *storage.Block, tr storage.TimeRange) error {
+			err := netstorage.ExportBlocks(qtChild, sq, cp.deadline, func(mn *storage.MetricName, b *storage.Block, tr storage.TimeRange, workerID uint) error {
 				if err := bw.Error(); err != nil {
 					return err
 				}
 				if err := b.UnmarshalData(); err != nil {
-					return fmt.Errorf("cannot unmarshal block during export: %s", err)
+					return fmt.Errorf("cannot unmarshal block during export: %w", err)
 				}
 				xb := exportBlockPool.Get().(*exportBlock)
 				xb.mn = mn
 				xb.timestamps, xb.values = b.AppendRowsWithTimeRangeFilter(xb.timestamps[:0], xb.values[:0], tr)
 				if len(xb.timestamps) > 0 {
-					writeLineFunc(xb, resultsCh)
+					if err := writeLineFunc(xb, workerID); err != nil {
+						return err
+					}
 				}
 				xb.reset()
 				exportBlockPool.Put(xb)
 				return nil
 			})
-			close(resultsCh)
+			qtChild.Done()
 			doneCh <- err
 		}()
 	}
-
-	// writeResponseFunc must consume all the data from resultsCh.
-	writeResponseFunc(bw, resultsCh)
-	if err := bw.Flush(); err != nil {
-		return err
+	err := <-doneCh
+	if err == nil {
+		err = sw.flush()
 	}
-	err = <-doneCh
-	if err != nil {
-		return fmt.Errorf("error during sending the data to remote client: %w", err)
+	if err == nil {
+		if format == "promapi" {
+			WriteExportPromAPIFooter(bw, qt)
+		}
+		err = bw.Flush()
+	}
+	if err != nil && !netutil.IsTrivialNetworkError(err) {
+		return fmt.Errorf("cannot send data to remote client: %w", err)
 	}
 	return nil
 }
@@ -432,7 +479,7 @@ func (xb *exportBlock) reset() {
 }
 
 var exportBlockPool = &sync.Pool{
-	New: func() interface{} {
+	New: func() any {
 		return &exportBlock{}
 	},
 }
@@ -443,20 +490,17 @@ var exportBlockPool = &sync.Pool{
 func DeleteHandler(startTime time.Time, r *http.Request) error {
 	defer deleteDuration.UpdateDuration(startTime)
 
-	deadline := searchutils.GetDeadlineForQuery(r, startTime)
-	if err := r.ParseForm(); err != nil {
-		return fmt.Errorf("cannot parse request form values: %w", err)
-	}
-	if r.FormValue("start") != "" || r.FormValue("end") != "" {
-		return fmt.Errorf("start and end aren't supported. Remove these args from the query in order to delete all the matching metrics")
-	}
-	tagFilterss, err := getTagFilterssFromRequest(r)
+	cp, err := getCommonParams(r, startTime, true)
 	if err != nil {
 		return err
 	}
-	ct := startTime.UnixNano() / 1e6
-	sq := storage.NewSearchQuery(0, ct, tagFilterss)
-	deletedCount, err := netstorage.DeleteSeries(sq, deadline)
+	cp.deadline = searchutils.GetDeadlineForDelete(r, startTime)
+
+	if !cp.IsDefaultTimeRange() {
+		return fmt.Errorf("start=%d and end=%d args aren't supported. Remove these args from the query in order to delete all the matching metrics", cp.start, cp.end)
+	}
+	sq := storage.NewSearchQuery(cp.start, cp.end, cp.filterss, *maxDeleteSeries)
+	deletedCount, err := netstorage.DeleteSeries(nil, sq, cp.deadline)
 	if err != nil {
 		return fmt.Errorf("cannot delete time series: %w", err)
 	}
@@ -471,168 +515,34 @@ var deleteDuration = metrics.NewSummary(`vm_request_duration_seconds{path="/api/
 // LabelValuesHandler processes /api/v1/label/<labelName>/values request.
 //
 // See https://prometheus.io/docs/prometheus/latest/querying/api/#querying-label-values
-func LabelValuesHandler(startTime time.Time, labelName string, w http.ResponseWriter, r *http.Request) error {
+func LabelValuesHandler(qt *querytracer.Tracer, startTime time.Time, labelName string, w http.ResponseWriter, r *http.Request) error {
 	defer labelValuesDuration.UpdateDuration(startTime)
 
-	deadline := searchutils.GetDeadlineForQuery(r, startTime)
-	if err := r.ParseForm(); err != nil {
-		return fmt.Errorf("cannot parse form values: %w", err)
-	}
-	etf, err := searchutils.GetEnforcedTagFiltersFromRequest(r)
+	cp, err := getCommonParamsForLabelsAPI(r, startTime, false)
 	if err != nil {
 		return err
 	}
-	matches := getMatchesFromRequest(r)
-	var labelValues []string
-	if len(matches) == 0 && len(etf) == 0 {
-		if len(r.Form["start"]) == 0 && len(r.Form["end"]) == 0 {
-			var err error
-			labelValues, err = netstorage.GetLabelValues(labelName, deadline)
-			if err != nil {
-				return fmt.Errorf(`cannot obtain label values for %q: %w`, labelName, err)
-			}
-		} else {
-			ct := startTime.UnixNano() / 1e6
-			end, err := searchutils.GetTime(r, "end", ct)
-			if err != nil {
-				return err
-			}
-			start, err := searchutils.GetTime(r, "start", end-defaultStep)
-			if err != nil {
-				return err
-			}
-			tr := storage.TimeRange{
-				MinTimestamp: start,
-				MaxTimestamp: end,
-			}
-			labelValues, err = netstorage.GetLabelValuesOnTimeRange(labelName, tr, deadline)
-			if err != nil {
-				return fmt.Errorf(`cannot obtain label values on time range for %q: %w`, labelName, err)
-			}
-		}
-	} else {
-		// Extended functionality that allows filtering by label filters and time range
-		// i.e. /api/v1/label/foo/values?match[]=foobar{baz="abc"}&start=...&end=...
-		// is equivalent to `label_values(foobar{baz="abc"}, foo)` call on the selected
-		// time range in Grafana templating.
-		if len(matches) == 0 {
-			matches = []string{fmt.Sprintf("{%s!=''}", labelName)}
-		}
-		ct := startTime.UnixNano() / 1e6
-		end, err := searchutils.GetTime(r, "end", ct)
-		if err != nil {
-			return err
-		}
-		start, err := searchutils.GetTime(r, "start", end-defaultStep)
-		if err != nil {
-			return err
-		}
-		labelValues, err = labelValuesWithMatches(labelName, matches, etf, start, end, deadline)
-		if err != nil {
-			return fmt.Errorf("cannot obtain label values for %q, match[]=%q, start=%d, end=%d: %w", labelName, matches, start, end, err)
-		}
+	limit, err := httputils.GetInt(r, "limit")
+	if err != nil {
+		return err
+	}
+	sq := storage.NewSearchQuery(cp.start, cp.end, cp.filterss, *maxLabelsAPISeries)
+	labelValues, err := netstorage.LabelValues(qt, labelName, sq, limit, cp.deadline)
+	if err != nil {
+		return fmt.Errorf("cannot obtain values for label %q: %w", labelName, err)
 	}
 
 	w.Header().Set("Content-Type", "application/json")
 	bw := bufferedwriter.Get(w)
 	defer bufferedwriter.Put(bw)
-	WriteLabelValuesResponse(bw, labelValues)
+	WriteLabelValuesResponse(bw, labelValues, qt)
 	if err := bw.Flush(); err != nil {
 		return fmt.Errorf("canot flush label values to remote client: %w", err)
 	}
 	return nil
 }
 
-func labelValuesWithMatches(labelName string, matches []string, etf []storage.TagFilter, start, end int64, deadline searchutils.Deadline) ([]string, error) {
-	tagFilterss, err := getTagFilterssFromMatches(matches)
-	if err != nil {
-		return nil, err
-	}
-
-	// Add `labelName!=''` tag filter in order to filter out series without the labelName.
-	// There is no need in adding `__name__!=''` filter, since all the time series should
-	// already have non-empty name.
-	if labelName != "__name__" {
-		key := []byte(labelName)
-		for i, tfs := range tagFilterss {
-			tagFilterss[i] = append(tfs, storage.TagFilter{
-				Key:        key,
-				IsNegative: true,
-			})
-		}
-	}
-	if start >= end {
-		end = start + defaultStep
-	}
-	tagFilterss = addEnforcedFiltersToTagFilterss(tagFilterss, etf)
-	if len(tagFilterss) == 0 {
-		logger.Panicf("BUG: tagFilterss must be non-empty")
-	}
-	sq := storage.NewSearchQuery(start, end, tagFilterss)
-	m := make(map[string]struct{})
-	if end-start > 24*3600*1000 {
-		// It is cheaper to call SearchMetricNames on time ranges exceeding a day.
-		mns, err := netstorage.SearchMetricNames(sq, deadline)
-		if err != nil {
-			return nil, fmt.Errorf("cannot fetch time series for %q: %w", sq, err)
-		}
-		for _, mn := range mns {
-			labelValue := mn.GetTagValue(labelName)
-			if len(labelValue) == 0 {
-				continue
-			}
-			m[string(labelValue)] = struct{}{}
-		}
-	} else {
-		rss, err := netstorage.ProcessSearchQuery(sq, false, deadline)
-		if err != nil {
-			return nil, fmt.Errorf("cannot fetch data for %q: %w", sq, err)
-		}
-		var mLock sync.Mutex
-		err = rss.RunParallel(func(rs *netstorage.Result, workerID uint) error {
-			labelValue := rs.MetricName.GetTagValue(labelName)
-			if len(labelValue) == 0 {
-				return nil
-			}
-			mLock.Lock()
-			m[string(labelValue)] = struct{}{}
-			mLock.Unlock()
-			return nil
-		})
-		if err != nil {
-			return nil, fmt.Errorf("cannot fetch label values from storage: %w", err)
-		}
-	}
-	labelValues := make([]string, 0, len(m))
-	for labelValue := range m {
-		labelValues = append(labelValues, labelValue)
-	}
-	sort.Strings(labelValues)
-	return labelValues, nil
-}
-
 var labelValuesDuration = metrics.NewSummary(`vm_request_duration_seconds{path="/api/v1/label/{}/values"}`)
-
-// LabelsCountHandler processes /api/v1/labels/count request.
-func LabelsCountHandler(startTime time.Time, w http.ResponseWriter, r *http.Request) error {
-	defer labelsCountDuration.UpdateDuration(startTime)
-
-	deadline := searchutils.GetDeadlineForStatusRequest(r, startTime)
-	labelEntries, err := netstorage.GetLabelEntries(deadline)
-	if err != nil {
-		return fmt.Errorf(`cannot obtain label entries: %w`, err)
-	}
-	w.Header().Set("Content-Type", "application/json")
-	bw := bufferedwriter.Get(w)
-	defer bufferedwriter.Put(bw)
-	WriteLabelsCountResponse(bw, labelEntries)
-	if err := bw.Flush(); err != nil {
-		return fmt.Errorf("cannot send labels count response to remote client: %w", err)
-	}
-	return nil
-}
-
-var labelsCountDuration = metrics.NewSummary(`vm_request_duration_seconds{path="/api/v1/labels/count"}`)
 
 const secsPerDay = 3600 * 24
 
@@ -641,28 +551,29 @@ const secsPerDay = 3600 * 24
 // See https://prometheus.io/docs/prometheus/latest/querying/api/#tsdb-stats
 //
 // It can accept `match[]` filters in order to narrow down the search.
-func TSDBStatusHandler(startTime time.Time, w http.ResponseWriter, r *http.Request) error {
+func TSDBStatusHandler(qt *querytracer.Tracer, startTime time.Time, w http.ResponseWriter, r *http.Request) error {
 	defer tsdbStatusDuration.UpdateDuration(startTime)
 
-	deadline := searchutils.GetDeadlineForStatusRequest(r, startTime)
-	if err := r.ParseForm(); err != nil {
-		return fmt.Errorf("cannot parse form values: %w", err)
-	}
-	etf, err := searchutils.GetEnforcedTagFiltersFromRequest(r)
+	cp, err := getCommonParams(r, startTime, false)
 	if err != nil {
 		return err
 	}
-	matches := getMatchesFromRequest(r)
+	cp.deadline = searchutils.GetDeadlineForStatusRequest(r, startTime)
 
 	date := fasttime.UnixDate()
 	dateStr := r.FormValue("date")
 	if len(dateStr) > 0 {
-		t, err := time.Parse("2006-01-02", dateStr)
-		if err != nil {
-			return fmt.Errorf("cannot parse `date` arg %q: %w", dateStr, err)
+		if dateStr == "0" {
+			date = 0
+		} else {
+			t, err := time.Parse("2006-01-02", dateStr)
+			if err != nil {
+				return fmt.Errorf("cannot parse `date` arg %q: %w", dateStr, err)
+			}
+			date = uint64(t.Unix()) / secsPerDay
 		}
-		date = uint64(t.Unix()) / secsPerDay
 	}
+	focusLabel := r.FormValue("focusLabel")
 	topN := 10
 	topNStr := r.FormValue("topN")
 	if len(topNStr) > 0 {
@@ -678,45 +589,22 @@ func TSDBStatusHandler(startTime time.Time, w http.ResponseWriter, r *http.Reque
 		}
 		topN = n
 	}
-	var status *storage.TSDBStatus
-	if len(matches) == 0 && len(etf) == 0 {
-		status, err = netstorage.GetTSDBStatusForDate(deadline, date, topN)
-		if err != nil {
-			return fmt.Errorf(`cannot obtain tsdb status for date=%d, topN=%d: %w`, date, topN, err)
-		}
-	} else {
-		status, err = tsdbStatusWithMatches(matches, etf, date, topN, deadline)
-		if err != nil {
-			return fmt.Errorf("cannot obtain tsdb status with matches for date=%d, topN=%d: %w", date, topN, err)
-		}
+	start := int64(date*secsPerDay) * 1000
+	end := int64((date+1)*secsPerDay)*1000 - 1
+	sq := storage.NewSearchQuery(start, end, cp.filterss, *maxTSDBStatusSeries)
+	status, err := netstorage.TSDBStatus(qt, sq, focusLabel, topN, cp.deadline)
+	if err != nil {
+		return fmt.Errorf("cannot obtain tsdb stats: %w", err)
 	}
+
 	w.Header().Set("Content-Type", "application/json")
 	bw := bufferedwriter.Get(w)
 	defer bufferedwriter.Put(bw)
-	WriteTSDBStatusResponse(bw, status)
+	WriteTSDBStatusResponse(bw, status, qt)
 	if err := bw.Flush(); err != nil {
 		return fmt.Errorf("cannot send tsdb status response to remote client: %w", err)
 	}
 	return nil
-}
-
-func tsdbStatusWithMatches(matches []string, etf []storage.TagFilter, date uint64, topN int, deadline searchutils.Deadline) (*storage.TSDBStatus, error) {
-	tagFilterss, err := getTagFilterssFromMatches(matches)
-	if err != nil {
-		return nil, err
-	}
-	tagFilterss = addEnforcedFiltersToTagFilterss(tagFilterss, etf)
-	if len(tagFilterss) == 0 {
-		logger.Panicf("BUG: tagFilterss must be non-empty")
-	}
-	start := int64(date*secsPerDay) * 1000
-	end := int64(date*secsPerDay+secsPerDay) * 1000
-	sq := storage.NewSearchQuery(start, end, tagFilterss)
-	status, err := netstorage.GetTSDBStatusWithFilters(deadline, sq, topN)
-	if err != nil {
-		return nil, err
-	}
-	return status, nil
 }
 
 var tsdbStatusDuration = metrics.NewSummary(`vm_request_duration_seconds{path="/api/v1/status/tsdb"}`)
@@ -724,129 +612,31 @@ var tsdbStatusDuration = metrics.NewSummary(`vm_request_duration_seconds{path="/
 // LabelsHandler processes /api/v1/labels request.
 //
 // See https://prometheus.io/docs/prometheus/latest/querying/api/#getting-label-names
-func LabelsHandler(startTime time.Time, w http.ResponseWriter, r *http.Request) error {
+func LabelsHandler(qt *querytracer.Tracer, startTime time.Time, w http.ResponseWriter, r *http.Request) error {
 	defer labelsDuration.UpdateDuration(startTime)
 
-	deadline := searchutils.GetDeadlineForQuery(r, startTime)
-	if err := r.ParseForm(); err != nil {
-		return fmt.Errorf("cannot parse form values: %w", err)
-	}
-	etf, err := searchutils.GetEnforcedTagFiltersFromRequest(r)
+	cp, err := getCommonParamsForLabelsAPI(r, startTime, false)
 	if err != nil {
 		return err
 	}
-	matches := getMatchesFromRequest(r)
-	var labels []string
-	if len(matches) == 0 && len(etf) == 0 {
-		if len(r.Form["start"]) == 0 && len(r.Form["end"]) == 0 {
-			var err error
-			labels, err = netstorage.GetLabels(deadline)
-			if err != nil {
-				return fmt.Errorf("cannot obtain labels: %w", err)
-			}
-		} else {
-			ct := startTime.UnixNano() / 1e6
-			end, err := searchutils.GetTime(r, "end", ct)
-			if err != nil {
-				return err
-			}
-			start, err := searchutils.GetTime(r, "start", end-defaultStep)
-			if err != nil {
-				return err
-			}
-			tr := storage.TimeRange{
-				MinTimestamp: start,
-				MaxTimestamp: end,
-			}
-			labels, err = netstorage.GetLabelsOnTimeRange(tr, deadline)
-			if err != nil {
-				return fmt.Errorf("cannot obtain labels on time range: %w", err)
-			}
-		}
-	} else {
-		// Extended functionality that allows filtering by label filters and time range
-		// i.e. /api/v1/labels?match[]=foobar{baz="abc"}&start=...&end=...
-		if len(matches) == 0 {
-			matches = []string{"{__name__!=''}"}
-		}
-		ct := startTime.UnixNano() / 1e6
-		end, err := searchutils.GetTime(r, "end", ct)
-		if err != nil {
-			return err
-		}
-		start, err := searchutils.GetTime(r, "start", end-defaultStep)
-		if err != nil {
-			return err
-		}
-		labels, err = labelsWithMatches(matches, etf, start, end, deadline)
-		if err != nil {
-			return fmt.Errorf("cannot obtain labels for match[]=%q, start=%d, end=%d: %w", matches, start, end, err)
-		}
+	limit, err := httputils.GetInt(r, "limit")
+	if err != nil {
+		return err
+	}
+	sq := storage.NewSearchQuery(cp.start, cp.end, cp.filterss, *maxLabelsAPISeries)
+	labels, err := netstorage.LabelNames(qt, sq, limit, cp.deadline)
+	if err != nil {
+		return fmt.Errorf("cannot obtain labels: %w", err)
 	}
 
 	w.Header().Set("Content-Type", "application/json")
 	bw := bufferedwriter.Get(w)
 	defer bufferedwriter.Put(bw)
-	WriteLabelsResponse(bw, labels)
+	WriteLabelsResponse(bw, labels, qt)
 	if err := bw.Flush(); err != nil {
 		return fmt.Errorf("cannot send labels response to remote client: %w", err)
 	}
 	return nil
-}
-
-func labelsWithMatches(matches []string, etf []storage.TagFilter, start, end int64, deadline searchutils.Deadline) ([]string, error) {
-	tagFilterss, err := getTagFilterssFromMatches(matches)
-	if err != nil {
-		return nil, err
-	}
-	if start >= end {
-		end = start + defaultStep
-	}
-	tagFilterss = addEnforcedFiltersToTagFilterss(tagFilterss, etf)
-	if len(tagFilterss) == 0 {
-		logger.Panicf("BUG: tagFilterss must be non-empty")
-	}
-	sq := storage.NewSearchQuery(start, end, tagFilterss)
-	m := make(map[string]struct{})
-	if end-start > 24*3600*1000 {
-		// It is cheaper to call SearchMetricNames on time ranges exceeding a day.
-		mns, err := netstorage.SearchMetricNames(sq, deadline)
-		if err != nil {
-			return nil, fmt.Errorf("cannot fetch time series for %q: %w", sq, err)
-		}
-		for _, mn := range mns {
-			for _, tag := range mn.Tags {
-				m[string(tag.Key)] = struct{}{}
-			}
-		}
-		if len(mns) > 0 {
-			m["__name__"] = struct{}{}
-		}
-	} else {
-		rss, err := netstorage.ProcessSearchQuery(sq, false, deadline)
-		if err != nil {
-			return nil, fmt.Errorf("cannot fetch data for %q: %w", sq, err)
-		}
-		var mLock sync.Mutex
-		err = rss.RunParallel(func(rs *netstorage.Result, workerID uint) error {
-			mLock.Lock()
-			for _, tag := range rs.MetricName.Tags {
-				m[string(tag.Key)] = struct{}{}
-			}
-			m["__name__"] = struct{}{}
-			mLock.Unlock()
-			return nil
-		})
-		if err != nil {
-			return nil, fmt.Errorf("cannot fetch labels from storage: %w", err)
-		}
-	}
-	labels := make([]string, 0, len(m))
-	for label := range m {
-		labels = append(labels, label)
-	}
-	sort.Strings(labels)
-	return labels, nil
 }
 
 var labelsDuration = metrics.NewSummary(`vm_request_duration_seconds{path="/api/v1/labels"}`)
@@ -856,7 +646,7 @@ func SeriesCountHandler(startTime time.Time, w http.ResponseWriter, r *http.Requ
 	defer seriesCountDuration.UpdateDuration(startTime)
 
 	deadline := searchutils.GetDeadlineForStatusRequest(r, startTime)
-	n, err := netstorage.GetSeriesCount(deadline)
+	n, err := netstorage.SeriesCount(nil, deadline)
 	if err != nil {
 		return fmt.Errorf("cannot obtain series count: %w", err)
 	}
@@ -875,95 +665,39 @@ var seriesCountDuration = metrics.NewSummary(`vm_request_duration_seconds{path="
 // SeriesHandler processes /api/v1/series request.
 //
 // See https://prometheus.io/docs/prometheus/latest/querying/api/#finding-series-by-label-matchers
-func SeriesHandler(startTime time.Time, w http.ResponseWriter, r *http.Request) error {
+func SeriesHandler(qt *querytracer.Tracer, startTime time.Time, w http.ResponseWriter, r *http.Request) error {
 	defer seriesDuration.UpdateDuration(startTime)
 
-	ct := startTime.UnixNano() / 1e6
-	if err := r.ParseForm(); err != nil {
-		return fmt.Errorf("cannot parse form values: %w", err)
-	}
-	end, err := searchutils.GetTime(r, "end", ct)
-	if err != nil {
-		return err
-	}
-	// Do not set start to searchutils.minTimeMsecs by default as Prometheus does,
+	// Do not set start to httputils.minTimeMsecs by default as Prometheus does,
 	// since this leads to fetching and scanning all the data from the storage,
 	// which can take a lot of time for big storages.
 	// It is better setting start as end-defaultStep by default.
 	// See https://github.com/VictoriaMetrics/VictoriaMetrics/issues/91
-	start, err := searchutils.GetTime(r, "start", end-defaultStep)
+	cp, err := getCommonParamsForLabelsAPI(r, startTime, true)
 	if err != nil {
 		return err
 	}
-	deadline := searchutils.GetDeadlineForQuery(r, startTime)
-
-	tagFilterss, err := getTagFilterssFromRequest(r)
+	limit, err := httputils.GetInt(r, "limit")
 	if err != nil {
 		return err
 	}
-	if start >= end {
-		end = start + defaultStep
-	}
-	sq := storage.NewSearchQuery(start, end, tagFilterss)
-	if end-start > 24*3600*1000 {
-		// It is cheaper to call SearchMetricNames on time ranges exceeding a day.
-		mns, err := netstorage.SearchMetricNames(sq, deadline)
-		if err != nil {
-			return fmt.Errorf("cannot fetch time series for %q: %w", sq, err)
-		}
-		w.Header().Set("Content-Type", "application/json")
-		bw := bufferedwriter.Get(w)
-		defer bufferedwriter.Put(bw)
-		resultsCh := make(chan *quicktemplate.ByteBuffer)
-		go func() {
-			for i := range mns {
-				bb := quicktemplate.AcquireByteBuffer()
-				writemetricNameObject(bb, &mns[i])
-				resultsCh <- bb
-			}
-			close(resultsCh)
-		}()
-		// WriteSeriesResponse must consume all the data from resultsCh.
-		WriteSeriesResponse(bw, resultsCh)
-		if err := bw.Flush(); err != nil {
-			return err
-		}
-		seriesDuration.UpdateDuration(startTime)
-		return nil
-	}
-	rss, err := netstorage.ProcessSearchQuery(sq, false, deadline)
-	if err != nil {
-		return fmt.Errorf("cannot fetch data for %q: %w", sq, err)
-	}
 
+	sq := storage.NewSearchQuery(cp.start, cp.end, cp.filterss, *maxSeriesLimit)
+	metricNames, err := netstorage.SearchMetricNames(qt, sq, cp.deadline)
+	if err != nil {
+		return fmt.Errorf("cannot fetch time series for %q: %w", sq, err)
+	}
 	w.Header().Set("Content-Type", "application/json")
 	bw := bufferedwriter.Get(w)
 	defer bufferedwriter.Put(bw)
-	resultsCh := make(chan *quicktemplate.ByteBuffer)
-	doneCh := make(chan error)
-	go func() {
-		err := rss.RunParallel(func(rs *netstorage.Result, workerID uint) error {
-			if err := bw.Error(); err != nil {
-				return err
-			}
-			bb := quicktemplate.AcquireByteBuffer()
-			writemetricNameObject(bb, &rs.MetricName)
-			resultsCh <- bb
-			return nil
-		})
-		close(resultsCh)
-		doneCh <- err
-	}()
-	// WriteSeriesResponse must consume all the data from resultsCh.
-	WriteSeriesResponse(bw, resultsCh)
-	if err := bw.Flush(); err != nil {
-		return fmt.Errorf("cannot flush series response to remote client: %w", err)
+	if limit > 0 && limit < len(metricNames) {
+		metricNames = metricNames[:limit]
 	}
-	err = <-doneCh
-	if err != nil {
-		return fmt.Errorf("cannot send series response to remote client: %w", err)
+	qtDone := func() {
+		qt.Donef("start=%d, end=%d", cp.start, cp.end)
 	}
-	return nil
+	WriteSeriesResponse(bw, metricNames, qt, qtDone)
+	return bw.Flush()
 }
 
 var seriesDuration = metrics.NewSummary(`vm_request_duration_seconds{path="/api/v1/series"}`)
@@ -971,15 +705,17 @@ var seriesDuration = metrics.NewSummary(`vm_request_duration_seconds{path="/api/
 // QueryHandler processes /api/v1/query request.
 //
 // See https://prometheus.io/docs/prometheus/latest/querying/api/#instant-queries
-func QueryHandler(startTime time.Time, w http.ResponseWriter, r *http.Request) error {
+func QueryHandler(qt *querytracer.Tracer, startTime time.Time, w http.ResponseWriter, r *http.Request) error {
 	defer queryDuration.UpdateDuration(startTime)
 
 	ct := startTime.UnixNano() / 1e6
+	deadline := searchutils.GetDeadlineForQuery(r, startTime)
+	mayCache := !httputils.GetBool(r, "nocache")
 	query := r.FormValue("query")
 	if len(query) == 0 {
 		return fmt.Errorf("missing `query` arg")
 	}
-	start, err := searchutils.GetTime(r, "time", ct)
+	start, err := httputils.GetTime(r, "time", ct)
 	if err != nil {
 		return err
 	}
@@ -987,24 +723,26 @@ func QueryHandler(startTime time.Time, w http.ResponseWriter, r *http.Request) e
 	if err != nil {
 		return err
 	}
-	step, err := searchutils.GetDuration(r, "step", lookbackDelta)
+	step, err := httputils.GetDuration(r, "step", lookbackDelta)
 	if err != nil {
 		return err
 	}
 	if step <= 0 {
 		step = defaultStep
 	}
-	deadline := searchutils.GetDeadlineForQuery(r, startTime)
 
-	if len(query) > maxQueryLen.N {
+	if len(query) > maxQueryLen.IntN() {
 		return fmt.Errorf("too long query; got %d bytes; mustn't exceed `-search.maxQueryLen=%d` bytes", len(query), maxQueryLen.N)
 	}
-	etf, err := searchutils.GetEnforcedTagFiltersFromRequest(r)
+	etfs, err := searchutils.GetExtraTagFilters(r)
 	if err != nil {
 		return err
 	}
 	if childQuery, windowExpr, offsetExpr := promql.IsMetricSelectorWithRollup(query); childQuery != "" {
-		window := windowExpr.Duration(step)
+		window, err := windowExpr.NonNegativeDuration(step)
+		if err != nil {
+			return fmt.Errorf("cannot parse lookbehind window in square brackets at %s: %w", query, err)
+		}
 		offset := offsetExpr.Duration(step)
 		start -= offset
 		end := start
@@ -1014,31 +752,51 @@ func QueryHandler(startTime time.Time, w http.ResponseWriter, r *http.Request) e
 		if end < start {
 			end = start
 		}
-		if err := exportHandler(w, []string{childQuery}, etf, start, end, "promapi", 0, false, deadline); err != nil {
+
+		tagFilterss, err := getTagFilterssFromMatches([]string{childQuery})
+		if err != nil {
+			return err
+		}
+		filterss := searchutils.JoinTagFilterss(tagFilterss, etfs)
+
+		cp := &commonParams{
+			deadline: deadline,
+			start:    start,
+			end:      end,
+			filterss: filterss,
+		}
+		if err := exportHandler(qt, w, cp, "promapi", 0, false); err != nil {
 			return fmt.Errorf("error when exporting data for query=%q on the time range (start=%d, end=%d): %w", childQuery, start, end, err)
 		}
-		queryDuration.UpdateDuration(startTime)
 		return nil
 	}
 	if childQuery, windowExpr, stepExpr, offsetExpr := promql.IsRollup(query); childQuery != "" {
-		newStep := stepExpr.Duration(step)
+		newStep, err := stepExpr.NonNegativeDuration(step)
+		if err != nil {
+			return fmt.Errorf("cannot parse step in square brackets at %s: %w", query, err)
+		}
 		if newStep > 0 {
 			step = newStep
 		}
-		window := windowExpr.Duration(step)
+		window, err := windowExpr.NonNegativeDuration(step)
+		if err != nil {
+			return fmt.Errorf("cannot parse lookbehind window in square brackets at %s: %w", query, err)
+		}
 		offset := offsetExpr.Duration(step)
 		start -= offset
 		end := start
 		start = end - window
-		if err := queryRangeHandler(startTime, w, childQuery, start, end, step, r, ct, etf); err != nil {
+		if err := queryRangeHandler(qt, startTime, w, childQuery, start, end, step, r, ct, etfs); err != nil {
 			return fmt.Errorf("error when executing query=%q on the time range (start=%d, end=%d, step=%d): %w", childQuery, start, end, step, err)
 		}
-		queryDuration.UpdateDuration(startTime)
 		return nil
 	}
 
-	queryOffset := getLatencyOffsetMilliseconds()
-	if !searchutils.GetBool(r, "nocache") && ct-start < queryOffset && start-ct < queryOffset {
+	queryOffset, err := getLatencyOffsetMilliseconds(r)
+	if err != nil {
+		return err
+	}
+	if !httputils.GetBool(r, "nocache") && ct-start < queryOffset && start-ct < queryOffset {
 		// Adjust start time only if `nocache` arg isn't set.
 		// See https://github.com/VictoriaMetrics/VictoriaMetrics/issues/241
 		startPrev := start
@@ -1047,33 +805,50 @@ func QueryHandler(startTime time.Time, w http.ResponseWriter, r *http.Request) e
 	} else {
 		queryOffset = 0
 	}
-	ec := promql.EvalConfig{
-		Start:              start,
-		End:                start,
-		Step:               step,
-		QuotedRemoteAddr:   httpserver.GetQuotedRemoteAddr(r),
-		Deadline:           deadline,
-		LookbackDelta:      lookbackDelta,
-		RoundDigits:        getRoundDigits(r),
-		EnforcedTagFilters: etf,
+	qs := &promql.QueryStats{}
+	ec := &promql.EvalConfig{
+		Start:               start,
+		End:                 start,
+		Step:                step,
+		MaxPointsPerSeries:  *maxPointsPerTimeseries,
+		MaxSeries:           GetMaxUniqueTimeSeries(),
+		QuotedRemoteAddr:    httpserver.GetQuotedRemoteAddr(r),
+		Deadline:            deadline,
+		MayCache:            mayCache,
+		LookbackDelta:       lookbackDelta,
+		RoundDigits:         getRoundDigits(r),
+		EnforcedTagFilterss: etfs,
+		GetRequestURI: func() string {
+			return httpserver.GetRequestURI(r)
+		},
+
+		QueryStats: qs,
 	}
-	result, err := promql.Exec(&ec, query, true)
+	result, err := promql.Exec(qt, ec, query, true)
 	if err != nil {
 		return fmt.Errorf("error when executing query=%q for (time=%d, step=%d): %w", query, start, step, err)
 	}
 	if queryOffset > 0 {
 		for i := range result {
-			timestamps := result[i].Timestamps
+			r := &result[i]
+			// Do not modify r.Timestamps, since they may be shared among multiple series.
+			// Make a copy instead.
+			timestamps := append([]int64{}, r.Timestamps...)
 			for j := range timestamps {
 				timestamps[j] += queryOffset
 			}
+			r.Timestamps = timestamps
 		}
 	}
 
 	w.Header().Set("Content-Type", "application/json")
 	bw := bufferedwriter.Get(w)
 	defer bufferedwriter.Put(bw)
-	WriteQueryResponse(bw, result)
+	qtDone := func() {
+		qt.Donef("query=%s, time=%d: series=%d", query, start, len(result))
+	}
+
+	WriteQueryResponse(bw, result, qt, qtDone, qs)
 	if err := bw.Flush(); err != nil {
 		return fmt.Errorf("cannot flush query response to remote client: %w", err)
 	}
@@ -1085,7 +860,7 @@ var queryDuration = metrics.NewSummary(`vm_request_duration_seconds{path="/api/v
 // QueryRangeHandler processes /api/v1/query_range request.
 //
 // See https://prometheus.io/docs/prometheus/latest/querying/api/#range-queries
-func QueryRangeHandler(startTime time.Time, w http.ResponseWriter, r *http.Request) error {
+func QueryRangeHandler(qt *querytracer.Tracer, startTime time.Time, w http.ResponseWriter, r *http.Request) error {
 	defer queryRangeDuration.UpdateDuration(startTime)
 
 	ct := startTime.UnixNano() / 1e6
@@ -1093,67 +868,79 @@ func QueryRangeHandler(startTime time.Time, w http.ResponseWriter, r *http.Reque
 	if len(query) == 0 {
 		return fmt.Errorf("missing `query` arg")
 	}
-	start, err := searchutils.GetTime(r, "start", ct-defaultStep)
+	start, err := httputils.GetTime(r, "start", ct-defaultStep)
 	if err != nil {
 		return err
 	}
-	end, err := searchutils.GetTime(r, "end", ct)
+	end, err := httputils.GetTime(r, "end", ct)
 	if err != nil {
 		return err
 	}
-	step, err := searchutils.GetDuration(r, "step", defaultStep)
+	step, err := httputils.GetDuration(r, "step", defaultStep)
 	if err != nil {
 		return err
 	}
-	etf, err := searchutils.GetEnforcedTagFiltersFromRequest(r)
+	etfs, err := searchutils.GetExtraTagFilters(r)
 	if err != nil {
 		return err
 	}
-	if err := queryRangeHandler(startTime, w, query, start, end, step, r, ct, etf); err != nil {
+	if err := queryRangeHandler(qt, startTime, w, query, start, end, step, r, ct, etfs); err != nil {
 		return fmt.Errorf("error when executing query=%q on the time range (start=%d, end=%d, step=%d): %w", query, start, end, step, err)
 	}
 	return nil
 }
 
-func queryRangeHandler(startTime time.Time, w http.ResponseWriter, query string, start, end, step int64, r *http.Request, ct int64, etf []storage.TagFilter) error {
+func queryRangeHandler(qt *querytracer.Tracer, startTime time.Time, w http.ResponseWriter, query string,
+	start, end, step int64, r *http.Request, ct int64, etfs [][]storage.TagFilter) error {
 	deadline := searchutils.GetDeadlineForQuery(r, startTime)
-	mayCache := !searchutils.GetBool(r, "nocache")
+	mayCache := !httputils.GetBool(r, "nocache")
 	lookbackDelta, err := getMaxLookback(r)
 	if err != nil {
 		return err
 	}
 
 	// Validate input args.
-	if len(query) > maxQueryLen.N {
+	if len(query) > maxQueryLen.IntN() {
 		return fmt.Errorf("too long query; got %d bytes; mustn't exceed `-search.maxQueryLen=%d` bytes", len(query), maxQueryLen.N)
 	}
 	if start > end {
 		end = start + defaultStep
 	}
-	if err := promql.ValidateMaxPointsPerTimeseries(start, end, step); err != nil {
-		return err
+	if err := promql.ValidateMaxPointsPerSeries(start, end, step, *maxPointsPerTimeseries); err != nil {
+		return fmt.Errorf("%w; (see -search.maxPointsPerTimeseries command-line flag)", err)
 	}
 	if mayCache {
 		start, end = promql.AdjustStartEnd(start, end, step)
 	}
 
-	ec := promql.EvalConfig{
-		Start:              start,
-		End:                end,
-		Step:               step,
-		QuotedRemoteAddr:   httpserver.GetQuotedRemoteAddr(r),
-		Deadline:           deadline,
-		MayCache:           mayCache,
-		LookbackDelta:      lookbackDelta,
-		RoundDigits:        getRoundDigits(r),
-		EnforcedTagFilters: etf,
+	qs := &promql.QueryStats{}
+	ec := &promql.EvalConfig{
+		Start:               start,
+		End:                 end,
+		Step:                step,
+		MaxPointsPerSeries:  *maxPointsPerTimeseries,
+		MaxSeries:           GetMaxUniqueTimeSeries(),
+		QuotedRemoteAddr:    httpserver.GetQuotedRemoteAddr(r),
+		Deadline:            deadline,
+		MayCache:            mayCache,
+		LookbackDelta:       lookbackDelta,
+		RoundDigits:         getRoundDigits(r),
+		EnforcedTagFilterss: etfs,
+		GetRequestURI: func() string {
+			return httpserver.GetRequestURI(r)
+		},
+
+		QueryStats: qs,
 	}
-	result, err := promql.Exec(&ec, query, false)
+	result, err := promql.Exec(qt, ec, query, false)
 	if err != nil {
-		return fmt.Errorf("cannot execute query: %w", err)
+		return err
 	}
 	if step < maxStepForPointsAdjustment.Milliseconds() {
-		queryOffset := getLatencyOffsetMilliseconds()
+		queryOffset, err := getLatencyOffsetMilliseconds(r)
+		if err != nil {
+			return err
+		}
 		if ct-queryOffset < end {
 			result = adjustLastPoints(result, ct-queryOffset, ct+step)
 		}
@@ -1166,7 +953,10 @@ func queryRangeHandler(startTime time.Time, w http.ResponseWriter, query string,
 	w.Header().Set("Content-Type", "application/json")
 	bw := bufferedwriter.Get(w)
 	defer bufferedwriter.Put(bw)
-	WriteQueryRangeResponse(bw, result)
+	qtDone := func() {
+		qt.Donef("start=%d, end=%d, step=%d, query=%q: series=%d", start, end, step, query, len(result))
+	}
+	WriteQueryRangeResponse(bw, result, qt, qtDone, qs)
 	if err := bw.Flush(); err != nil {
 		return fmt.Errorf("cannot send query range response to remote client: %w", err)
 	}
@@ -1195,7 +985,9 @@ func removeEmptyValuesAndTimeseries(tss []netstorage.Result) []netstorage.Result
 		// Slow path: remove NaNs.
 		srcTimestamps := ts.Timestamps
 		dstValues := ts.Values[:0]
-		dstTimestamps := ts.Timestamps[:0]
+		// Do not re-use ts.Timestamps for dstTimestamps, since ts.Timestamps
+		// may be shared among multiple time series.
+		dstTimestamps := make([]int64, 0, len(ts.Timestamps))
 		for j, v := range ts.Values {
 			if math.IsNaN(v) {
 				continue
@@ -1251,55 +1043,31 @@ func getMaxLookback(r *http.Request) (int64, error) {
 	if d == 0 {
 		d = maxStalenessInterval.Milliseconds()
 	}
-	return searchutils.GetDuration(r, "max_lookback", d)
-}
-
-func addEnforcedFiltersToTagFilterss(dstTfss [][]storage.TagFilter, enforcedFilters []storage.TagFilter) [][]storage.TagFilter {
-	if len(dstTfss) == 0 {
-		return [][]storage.TagFilter{
-			enforcedFilters,
+	maxLookback, err := httputils.GetDuration(r, "max_lookback", d)
+	if err != nil {
+		return 0, err
+	}
+	d = maxLookback
+	if *setLookbackToStep {
+		step, err := httputils.GetDuration(r, "step", d)
+		if err != nil {
+			return 0, err
 		}
+		d = step
 	}
-	for i := range dstTfss {
-		dstTfss[i] = append(dstTfss[i], enforcedFilters...)
-	}
-	return dstTfss
+	return d, nil
 }
 
 func getTagFilterssFromMatches(matches []string) ([][]storage.TagFilter, error) {
-	tagFilterss := make([][]storage.TagFilter, 0, len(matches))
+	tfss := make([][]storage.TagFilter, 0, len(matches))
 	for _, match := range matches {
-		tagFilters, err := promql.ParseMetricSelector(match)
+		tfssLocal, err := searchutils.ParseMetricSelector(match)
 		if err != nil {
-			return nil, fmt.Errorf("cannot parse %q: %w", match, err)
+			return nil, fmt.Errorf("cannot parse matches[]=%s: %w", match, err)
 		}
-		tagFilterss = append(tagFilterss, tagFilters)
+		tfss = append(tfss, tfssLocal...)
 	}
-	return tagFilterss, nil
-}
-
-func getTagFilterssFromRequest(r *http.Request) ([][]storage.TagFilter, error) {
-	matches := getMatchesFromRequest(r)
-	if len(matches) == 0 {
-		return nil, fmt.Errorf("missing `match[]` query arg")
-	}
-	tagFilterss, err := getTagFilterssFromMatches(matches)
-	if err != nil {
-		return nil, err
-	}
-	etf, err := searchutils.GetEnforcedTagFiltersFromRequest(r)
-	if err != nil {
-		return nil, err
-	}
-	tagFilterss = addEnforcedFiltersToTagFilterss(tagFilterss, etf)
-	return tagFilterss, nil
-}
-
-func getMatchesFromRequest(r *http.Request) []string {
-	matches := r.Form["match[]"]
-	// This is needed for backwards compatibility
-	matches = append(matches, r.Form["match"]...)
-	return matches
+	return tfss, nil
 }
 
 func getRoundDigits(r *http.Request) int {
@@ -1314,21 +1082,18 @@ func getRoundDigits(r *http.Request) int {
 	return n
 }
 
-func getLatencyOffsetMilliseconds() int64 {
+func getLatencyOffsetMilliseconds(r *http.Request) (int64, error) {
 	d := latencyOffset.Milliseconds()
-	if d <= 1000 {
-		d = 1000
+	if d < 0 {
+		// Zero latency offset may be useful for some use cases.
+		// See https://github.com/VictoriaMetrics/VictoriaMetrics/issues/2061#issuecomment-1299109836
+		d = 0
 	}
-	return d
+	return httputils.GetDuration(r, "latency_offset", d)
 }
 
 // QueryStatsHandler returns query stats at `/api/v1/status/top_queries`
-func QueryStatsHandler(startTime time.Time, w http.ResponseWriter, r *http.Request) error {
-	defer queryStatsDuration.UpdateDuration(startTime)
-
-	if err := r.ParseForm(); err != nil {
-		return fmt.Errorf("cannot parse form values: %w", err)
-	}
+func QueryStatsHandler(w http.ResponseWriter, r *http.Request) error {
 	topN := 20
 	topNStr := r.FormValue("topN")
 	if len(topNStr) > 0 {
@@ -1338,7 +1103,7 @@ func QueryStatsHandler(startTime time.Time, w http.ResponseWriter, r *http.Reque
 		}
 		topN = n
 	}
-	maxLifetimeMsecs, err := searchutils.GetDuration(r, "maxLifetime", 10*60*1000)
+	maxLifetimeMsecs, err := httputils.GetDuration(r, "maxLifetime", 10*60*1000)
 	if err != nil {
 		return fmt.Errorf("cannot parse `maxLifetime` arg: %w", err)
 	}
@@ -1353,4 +1118,187 @@ func QueryStatsHandler(startTime time.Time, w http.ResponseWriter, r *http.Reque
 	return nil
 }
 
-var queryStatsDuration = metrics.NewSummary(`vm_request_duration_seconds{path="/api/v1/status/top_queries"}`)
+// commonParams contains common parameters for all /api/v1/* handlers
+//
+// timeout, start, end, match[], extra_label, extra_filters[]
+type commonParams struct {
+	deadline         searchutils.Deadline
+	start            int64
+	end              int64
+	currentTimestamp int64
+	filterss         [][]storage.TagFilter
+}
+
+func (cp *commonParams) IsDefaultTimeRange() bool {
+	return cp.start == 0 && cp.currentTimestamp-cp.end < 1000
+}
+
+// getExportParams obtains common params from r, which are used in /api/v1/export* handlers
+//
+// - timeout
+// - start
+// - end
+// - match[]
+// - extra_label
+// - extra_filters[]
+func getExportParams(r *http.Request, startTime time.Time) (*commonParams, error) {
+	cp, err := getCommonParams(r, startTime, true)
+	if err != nil {
+		return nil, err
+	}
+	cp.deadline = searchutils.GetDeadlineForExport(r, startTime)
+	return cp, nil
+}
+
+func getCommonParamsForLabelsAPI(r *http.Request, startTime time.Time, requireNonEmptyMatch bool) (*commonParams, error) {
+	cp, err := getCommonParamsInternal(r, startTime, requireNonEmptyMatch, true)
+	if err != nil {
+		return nil, err
+	}
+	if cp.start == 0 {
+		cp.start = cp.end - defaultStep
+	}
+	cp.deadline = searchutils.GetDeadlineForLabelsAPI(r, startTime)
+	return cp, nil
+}
+
+// getCommonParams obtains common params from r, which are used in /api/v1/* handlers:
+//
+// - timeout
+// - start
+// - end
+// - match[]
+// - extra_label
+// - extra_filters[]
+func getCommonParams(r *http.Request, startTime time.Time, requireNonEmptyMatch bool) (*commonParams, error) {
+	return getCommonParamsInternal(r, startTime, requireNonEmptyMatch, false)
+}
+
+func getCommonParamsInternal(r *http.Request, startTime time.Time, requireNonEmptyMatch, isLabelsAPI bool) (*commonParams, error) {
+	deadline := searchutils.GetDeadlineForQuery(r, startTime)
+	start, err := httputils.GetTime(r, "start", 0)
+	if err != nil {
+		return nil, err
+	}
+	ct := startTime.UnixNano() / 1e6
+	end, err := httputils.GetTime(r, "end", ct)
+	if err != nil {
+		return nil, err
+	}
+	// Limit the `end` arg to the current time +2 days in the same way
+	// as it is limited during data ingestion.
+	// See https://github.com/VictoriaMetrics/VictoriaMetrics/blob/ea06d2fd3ccbbb6aa4480ab3b04f7b671408be2a/lib/storage/table.go#L378
+	// This should fix possible timestamp overflow - see https://github.com/VictoriaMetrics/VictoriaMetrics/issues/2669
+	maxTS := startTime.UnixNano()/1e6 + 2*24*3600*1000
+	if end > maxTS {
+		end = maxTS
+	}
+	if end < start {
+		end = start
+	}
+	matches := append([]string{}, r.Form["match[]"]...)
+	matches = append(matches, r.Form["match"]...)
+	if requireNonEmptyMatch && len(matches) == 0 {
+		return nil, fmt.Errorf("missing `match[]` arg")
+	}
+	filterss, err := getTagFilterssFromMatches(matches)
+	if err != nil {
+		return nil, err
+	}
+
+	if len(filterss) > 0 || !isLabelsAPI || !*ignoreExtraFiltersAtLabelsAPI {
+		// If matches isn't empty, then there is no sense in ignoring extra filters
+		// even if ignoreExtraLabelsAtLabelsAPI is set, since extra filters won't slow down
+		// the query - they can only improve query performance by reducing the number
+		// of matching series at the storage level.
+		etfs, err := searchutils.GetExtraTagFilters(r)
+		if err != nil {
+			return nil, err
+		}
+		filterss = searchutils.JoinTagFilterss(filterss, etfs)
+	}
+
+	cp := &commonParams{
+		deadline:         deadline,
+		start:            start,
+		end:              end,
+		currentTimestamp: ct,
+		filterss:         filterss,
+	}
+	return cp, nil
+}
+
+type scalableWriter struct {
+	bw *bufferedwriter.Writer
+	m  sync.Map
+}
+
+func newScalableWriter(bw *bufferedwriter.Writer) *scalableWriter {
+	return &scalableWriter{
+		bw: bw,
+	}
+}
+
+func (sw *scalableWriter) getBuffer(workerID uint) *bytesutil.ByteBuffer {
+	v, ok := sw.m.Load(workerID)
+	if !ok {
+		v = &bytesutil.ByteBuffer{}
+		sw.m.Store(workerID, v)
+	}
+	return v.(*bytesutil.ByteBuffer)
+}
+
+func (sw *scalableWriter) maybeFlushBuffer(bb *bytesutil.ByteBuffer) error {
+	if len(bb.B) < 1024*1024 {
+		return nil
+	}
+	_, err := sw.bw.Write(bb.B)
+	bb.Reset()
+	return err
+}
+
+func (sw *scalableWriter) flush() error {
+	sw.m.Range(func(_, v any) bool {
+		bb := v.(*bytesutil.ByteBuffer)
+		_, err := sw.bw.Write(bb.B)
+		return err == nil
+	})
+	return sw.bw.Flush()
+}
+
+var (
+	maxUniqueTimeseriesValueOnce sync.Once
+	maxUniqueTimeseriesValue     int
+)
+
+// InitMaxUniqueTimeseries init the max metrics limit calculated by available resources.
+// The calculation is split into calculateMaxUniqueTimeSeriesForResource for unit testing.
+func InitMaxUniqueTimeseries(maxConcurrentRequests int) {
+	maxUniqueTimeseriesValueOnce.Do(func() {
+		maxUniqueTimeseriesValue = *maxUniqueTimeseries
+		if maxUniqueTimeseriesValue <= 0 {
+			maxUniqueTimeseriesValue = calculateMaxUniqueTimeSeriesForResource(maxConcurrentRequests, memory.Remaining())
+		}
+	})
+}
+
+// calculateMaxUniqueTimeSeriesForResource calculate the max metrics limit calculated by available resources.
+func calculateMaxUniqueTimeSeriesForResource(maxConcurrentRequests, remainingMemory int) int {
+	if maxConcurrentRequests <= 0 {
+		// This line should NOT be reached unless the user has set an incorrect `search.maxConcurrentRequests`.
+		// In such cases, fallback to unlimited.
+		logger.Warnf("limiting -search.maxUniqueTimeseries to %v because -search.maxConcurrentRequests=%d.", 2e9, maxConcurrentRequests)
+		return 2e9
+	}
+
+	// Calculate the max metrics limit for a single request in the worst-case concurrent scenario.
+	// The approximate size of 1 unique series that could occupy in the vmstorage is 200 bytes.
+	mts := remainingMemory / 200 / maxConcurrentRequests
+	logger.Infof("limiting -search.maxUniqueTimeseries to %d according to -search.maxConcurrentRequests=%d and remaining memory=%d bytes. To increase the limit, reduce -search.maxConcurrentRequests or increase memory available to the process.", mts, maxConcurrentRequests, remainingMemory)
+	return mts
+}
+
+// GetMaxUniqueTimeSeries returns the max metrics limit calculated by available resources.
+func GetMaxUniqueTimeSeries() int {
+	return maxUniqueTimeseriesValue
+}

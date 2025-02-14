@@ -6,13 +6,14 @@ import (
 	"time"
 
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/promauth"
+	"github.com/VictoriaMetrics/VictoriaMetrics/lib/promutils"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/proxy"
 )
 
 // SDCheckInterval defines interval for dockerswarm targets refresh.
 var SDCheckInterval = flag.Duration("promscrape.dockerswarmSDCheckInterval", 30*time.Second, "Interval for checking for changes in dockerswarm. "+
 	"This works only if dockerswarm_sd_configs is configured in '-promscrape.config' file. "+
-	"See https://prometheus.io/docs/prometheus/latest/configuration/configuration/#dockerswarm_sd_config for details")
+	"See https://docs.victoriametrics.com/sd_configs/#dockerswarm_sd_configs for details")
 
 // SDConfig represents docker swarm service discovery configuration
 //
@@ -36,7 +37,7 @@ type Filter struct {
 }
 
 // GetLabels returns dockerswarm labels according to sdc.
-func (sdc *SDConfig) GetLabels(baseDir string) ([]map[string]string, error) {
+func (sdc *SDConfig) GetLabels(baseDir string) ([]*promutils.Labels, error) {
 	cfg, err := getAPIConfig(sdc, baseDir)
 	if err != nil {
 		return nil, fmt.Errorf("cannot get API config: %w", err)
@@ -49,11 +50,15 @@ func (sdc *SDConfig) GetLabels(baseDir string) ([]map[string]string, error) {
 	case "nodes":
 		return getNodesLabels(cfg)
 	default:
-		return nil, fmt.Errorf("unexpected `role`: %q; must be one of `tasks`, `services` or `nodes`; skipping it", sdc.Role)
+		return nil, fmt.Errorf("skipping unexpected role=%q; must be one of `tasks`, `services` or `nodes`", sdc.Role)
 	}
 }
 
 // MustStop stops further usage for sdc.
 func (sdc *SDConfig) MustStop() {
-	configMap.Delete(sdc)
+	v := configMap.Delete(sdc)
+	if v != nil {
+		cfg := v.(*apiConfig)
+		cfg.client.Stop()
+	}
 }

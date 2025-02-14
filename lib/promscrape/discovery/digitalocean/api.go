@@ -36,7 +36,7 @@ func newAPIConfig(sdc *SDConfig, baseDir string) (*apiConfig, error) {
 	if err != nil {
 		return nil, fmt.Errorf("cannot parse proxy auth config: %w", err)
 	}
-	client, err := discoveryutils.NewClient(apiServer, ac, sdc.ProxyURL, proxyAC)
+	client, err := discoveryutils.NewClient(apiServer, ac, sdc.ProxyURL, proxyAC, &sdc.HTTPClientConfig)
 	if err != nil {
 		return nil, fmt.Errorf("cannot create HTTP client for %q: %w", apiServer, err)
 	}
@@ -51,12 +51,11 @@ func newAPIConfig(sdc *SDConfig, baseDir string) (*apiConfig, error) {
 }
 
 func getAPIConfig(sdc *SDConfig, baseDir string) (*apiConfig, error) {
-	v, err := configMap.Get(sdc, func() (interface{}, error) { return newAPIConfig(sdc, baseDir) })
+	v, err := configMap.Get(sdc, func() (any, error) { return newAPIConfig(sdc, baseDir) })
 	if err != nil {
 		return nil, err
 	}
 	return v.(*apiConfig), nil
-
 }
 
 const dropletsAPIPath = "/v2/droplets"

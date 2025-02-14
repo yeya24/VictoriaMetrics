@@ -9,10 +9,38 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"unsafe"
 
+	"github.com/VictoriaMetrics/VictoriaMetrics/lib/bytesutil"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/logger"
+	"github.com/VictoriaMetrics/VictoriaMetrics/lib/lrucache"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/memory"
+	"github.com/VictoriaMetrics/VictoriaMetrics/lib/regexutil"
+	"github.com/VictoriaMetrics/VictoriaMetrics/lib/stringsutil"
 )
+
+func getCommonMetricNameForTagFilterss(tfss []*TagFilters) []byte {
+	if len(tfss) == 0 {
+		return nil
+	}
+	prevName := getMetricNameFilter(tfss[0])
+	for _, tfs := range tfss[1:] {
+		name := getMetricNameFilter(tfs)
+		if string(prevName) != string(name) {
+			return nil
+		}
+	}
+	return prevName
+}
+
+func getMetricNameFilter(tfs *TagFilters) []byte {
+	for _, tf := range tfs.tfs {
+		if len(tf.key) == 0 && !tf.isNegative && !tf.isRegexp {
+			return tf.value
+		}
+	}
+	return nil
+}
 
 // convertToCompositeTagFilterss converts tfss to composite filters.
 //
@@ -49,8 +77,11 @@ func convertToCompositeTagFilters(tfs *TagFilters) []*TagFilters {
 			hasPositiveFilter = true
 		}
 	}
-	if len(names) == 0 {
-		atomic.AddUint64(&compositeFilterMissingConversions, 1)
+	// If tfs have no filters on __name__ or have no non-negative filters,
+	// then it is impossible to construct composite tag filter.
+	// See https://github.com/VictoriaMetrics/VictoriaMetrics/issues/2238
+	if len(names) == 0 || !hasPositiveFilter {
+		compositeFilterMissingConversions.Add(1)
 		return []*TagFilters{tfs}
 	}
 
@@ -61,7 +92,7 @@ func convertToCompositeTagFilters(tfs *TagFilters) []*TagFilters {
 		tfsNew := make([]tagFilter, 0, len(tfs.tfs))
 		for _, tf := range tfs.tfs {
 			if len(tf.key) == 0 {
-				if !hasPositiveFilter || tf.isNegative {
+				if tf.isNegative {
 					// Negative filters on metric name cannot be used for building composite filter, so leave them as is.
 					tfsNew = append(tfsNew, tf)
 					continue
@@ -109,20 +140,20 @@ func convertToCompositeTagFilters(tfs *TagFilters) []*TagFilters {
 		if compositeFilters == 0 {
 			// Cannot use tfsNew, since it doesn't contain composite filters, e.g. it may match broader set of series.
 			// Fall back to the original tfs.
-			atomic.AddUint64(&compositeFilterMissingConversions, 1)
+			compositeFilterMissingConversions.Add(1)
 			return []*TagFilters{tfs}
 		}
 		tfsCompiled := NewTagFilters()
 		tfsCompiled.tfs = tfsNew
 		tfssCompiled = append(tfssCompiled, tfsCompiled)
 	}
-	atomic.AddUint64(&compositeFilterSuccessConversions, 1)
+	compositeFilterSuccessConversions.Add(1)
 	return tfssCompiled
 }
 
 var (
-	compositeFilterSuccessConversions uint64
-	compositeFilterMissingConversions uint64
+	compositeFilterSuccessConversions atomic.Uint64
+	compositeFilterMissingConversions atomic.Uint64
 )
 
 // TagFilters represents filters used for filtering tags.
@@ -162,7 +193,7 @@ func (tfs *TagFilters) Add(key, value []byte, isNegative, isRegexp bool) error {
 	}
 	if isRegexp && string(value) == ".*" {
 		if !isNegative {
-			// Skip tag filter matching anything, since it equal to no filter.
+			// Skip tag filter matching anything, since it equals to no filter.
 			return nil
 		}
 
@@ -205,16 +236,11 @@ func (tfs *TagFilters) addTagFilter() *tagFilter {
 
 // String returns human-readable value for tfs.
 func (tfs *TagFilters) String() string {
-	if len(tfs.tfs) == 0 {
-		return "{}"
+	a := make([]string, 0, len(tfs.tfs))
+	for _, tf := range tfs.tfs {
+		a = append(a, tf.String())
 	}
-	var bb bytes.Buffer
-	fmt.Fprintf(&bb, "{%s", tfs.tfs[0].String())
-	for i := range tfs.tfs[1:] {
-		fmt.Fprintf(&bb, ", %s", tfs.tfs[i+1].String())
-	}
-	fmt.Fprintf(&bb, "}")
-	return bb.String()
+	return fmt.Sprintf("{%s}", strings.Join(a, ","))
 }
 
 // Reset resets the tf
@@ -236,7 +262,7 @@ type tagFilter struct {
 	// contains the prefix for regexp filter if isRegexp==true.
 	regexpPrefix string
 
-	// Prefix always contains {nsPrefixTagToMetricIDs, key}.
+	// Prefix contains either {nsPrefixTagToMetricIDs, key} or {nsPrefixDateTagToMetricIDs, date, key}.
 	// Additionally it contains:
 	//  - value if !isRegexp.
 	//  - regexpPrefix if isRegexp.
@@ -290,20 +316,35 @@ func (tf *tagFilter) Less(other *tagFilter) bool {
 
 // String returns human-readable tf value.
 func (tf *tagFilter) String() string {
-	op := "="
-	if tf.isNegative {
-		op = "!="
-		if tf.isRegexp {
-			op = "!~"
+	op := tf.getOp()
+	value := stringsutil.LimitStringLen(string(tf.value), 60)
+	if bytes.Equal(tf.key, graphiteReverseTagKey) {
+		return fmt.Sprintf("__graphite_reverse__%s%q", op, value)
+	}
+	if tf.isComposite() {
+		metricName, key, err := unmarshalCompositeTagKey(tf.key)
+		if err != nil {
+			logger.Panicf("BUG: cannot unmarshal composite tag key: %s", err)
 		}
-	} else if tf.isRegexp {
-		op = "=~"
+		return fmt.Sprintf("composite(%s,%s)%s%q", metricName, key, op, value)
 	}
-	key := tf.key
-	if len(key) == 0 {
-		key = []byte("__name__")
+	if len(tf.key) == 0 {
+		return fmt.Sprintf("__name__%s%q", op, value)
 	}
-	return fmt.Sprintf("%s%s%q", key, op, tf.value)
+	return fmt.Sprintf("%s%s%q", tf.key, op, value)
+}
+
+func (tf *tagFilter) getOp() string {
+	if tf.isNegative {
+		if tf.isRegexp {
+			return "!~"
+		}
+		return "!="
+	}
+	if tf.isRegexp {
+		return "=~"
+	}
+	return "="
 }
 
 // Marshal appends marshaled tf to dst
@@ -346,7 +387,7 @@ func (tf *tagFilter) InitFromGraphiteQuery(commonPrefix, query []byte, paths []s
 	tf.regexpPrefix = prefix
 	tf.prefix = append(tf.prefix[:0], commonPrefix...)
 	tf.prefix = marshalTagValue(tf.prefix, nil)
-	tf.prefix = marshalTagValueNoTrailingTagSeparator(tf.prefix, []byte(prefix))
+	tf.prefix = marshalTagValueNoTrailingTagSeparator(tf.prefix, prefix)
 	tf.orSuffixes = append(tf.orSuffixes[:0], orSuffixes...)
 	tf.reSuffixMatch, tf.matchCost = newMatchFuncForOrSuffixes(orSuffixes)
 }
@@ -375,6 +416,8 @@ func getCommonPrefix(ss []string) (string, []string) {
 
 // Init initializes the tag filter for the given commonPrefix, key and value.
 //
+// commonPrefix must contain either {nsPrefixTagToMetricIDs} or {nsPrefixDateTagToMetricIDs, date}.
+//
 // If isNegaitve is true, then the tag filter matches all the values
 // except the given one.
 //
@@ -400,15 +443,15 @@ func (tf *tagFilter) Init(commonPrefix, key, value []byte, isNegative, isRegexp 
 	tf.prefix = append(tf.prefix, commonPrefix...)
 	tf.prefix = marshalTagValue(tf.prefix, key)
 
-	var expr []byte
-	prefix := tf.value
+	var expr string
+	prefix := bytesutil.ToUnsafeString(tf.value)
 	if tf.isRegexp {
-		prefix, expr = getRegexpPrefix(tf.value)
+		prefix, expr = simplifyRegexp(prefix)
 		if len(expr) == 0 {
 			tf.value = append(tf.value[:0], prefix...)
 			tf.isRegexp = false
 		} else {
-			tf.regexpPrefix = string(prefix)
+			tf.regexpPrefix = prefix
 		}
 	}
 	tf.prefix = marshalTagValueNoTrailingTagSeparator(tf.prefix, prefix)
@@ -466,46 +509,46 @@ func (tf *tagFilter) matchSuffix(b []byte) (bool, error) {
 
 // RegexpCacheSize returns the number of cached regexps for tag filters.
 func RegexpCacheSize() int {
-	regexpCacheLock.RLock()
-	n := len(regexpCacheMap)
-	regexpCacheLock.RUnlock()
-	return n
+	return regexpCache.Len()
 }
 
-// RegexpCacheRequests returns the number of requests to regexp cache.
+// RegexpCacheSizeBytes returns an approximate size in bytes for the cached regexps for tag filters.
+func RegexpCacheSizeBytes() int {
+	return regexpCache.SizeBytes()
+}
+
+// RegexpCacheMaxSizeBytes returns the maximum size in bytes for the cached regexps for tag filters.
+func RegexpCacheMaxSizeBytes() int {
+	return regexpCache.SizeMaxBytes()
+}
+
+// RegexpCacheRequests returns the number of requests to regexp cache for tag filters.
 func RegexpCacheRequests() uint64 {
-	return atomic.LoadUint64(&regexpCacheRequests)
+	return regexpCache.Requests()
 }
 
-// RegexpCacheMisses returns the number of cache misses for regexp cache.
+// RegexpCacheMisses returns the number of cache misses for regexp cache for tag filters.
 func RegexpCacheMisses() uint64 {
-	return atomic.LoadUint64(&regexpCacheMisses)
+	return regexpCache.Misses()
 }
 
-func getRegexpFromCache(expr []byte) (regexpCacheValue, error) {
-	atomic.AddUint64(&regexpCacheRequests, 1)
-
-	regexpCacheLock.RLock()
-	rcv, ok := regexpCacheMap[string(expr)]
-	regexpCacheLock.RUnlock()
-	if ok {
+func getRegexpFromCache(expr string) (*regexpCacheValue, error) {
+	if rcv := regexpCache.GetEntry(expr); rcv != nil {
 		// Fast path - the regexp found in the cache.
-		return rcv, nil
+		return rcv.(*regexpCacheValue), nil
 	}
-
 	// Slow path - build the regexp.
-	atomic.AddUint64(&regexpCacheMisses, 1)
-	exprOrig := string(expr)
+	exprOrig := expr
 
-	expr = []byte(tagCharsRegexpEscaper.Replace(exprOrig))
+	expr = tagCharsRegexpEscaper.Replace(exprOrig)
 	exprStr := fmt.Sprintf("^(%s)$", expr)
 	re, err := regexp.Compile(exprStr)
 	if err != nil {
-		return rcv, fmt.Errorf("invalid regexp %q: %w", exprStr, err)
+		return nil, fmt.Errorf("invalid regexp %q: %w", exprStr, err)
 	}
 
-	sExpr := string(expr)
-	orValues := getOrValues(sExpr)
+	sExpr := expr
+	orValues := regexutil.GetOrValuesPromRegex(sExpr)
 	var reMatch func(b []byte) bool
 	var reCost uint64
 	var literalSuffix string
@@ -516,26 +559,16 @@ func getRegexpFromCache(expr []byte) (regexpCacheValue, error) {
 	}
 
 	// Put the reMatch in the cache.
+	var rcv regexpCacheValue
 	rcv.orValues = orValues
 	rcv.reMatch = reMatch
 	rcv.reCost = reCost
 	rcv.literalSuffix = literalSuffix
+	// heuristic for rcv in-memory size
+	rcv.sizeBytes = 8*len(exprOrig) + len(literalSuffix)
+	regexpCache.PutEntry(exprOrig, &rcv)
 
-	regexpCacheLock.Lock()
-	if overflow := len(regexpCacheMap) - getMaxRegexpCacheSize(); overflow > 0 {
-		overflow = int(float64(len(regexpCacheMap)) * 0.1)
-		for k := range regexpCacheMap {
-			delete(regexpCacheMap, k)
-			overflow--
-			if overflow <= 0 {
-				break
-			}
-		}
-	}
-	regexpCacheMap[exprOrig] = rcv
-	regexpCacheLock.Unlock()
-
-	return rcv, nil
+	return &rcv, nil
 }
 
 func newMatchFuncForOrSuffixes(orValues []string) (reMatch func(b []byte) bool, reCost uint64) {
@@ -559,16 +592,17 @@ func newMatchFuncForOrSuffixes(orValues []string) (reMatch func(b []byte) bool, 
 }
 
 // getOptimizedReMatchFunc tries returning optimized function for matching the given expr.
-//   '.*'
-//   '.+'
-//   'literal.*'
-//   'literal.+'
-//   '.*literal'
-//   '.+literal
-//   '.*literal.*'
-//   '.*literal.+'
-//   '.+literal.*'
-//   '.+literal.+'
+//
+//	'.*'
+//	'.+'
+//	'literal.*'
+//	'literal.+'
+//	'.*literal'
+//	'.+literal
+//	'.*literal.*'
+//	'.*literal.+'
+//	'.+literal.*'
+//	'.+literal.+'
 //
 // It returns reMatch if it cannot find optimized function.
 //
@@ -578,13 +612,21 @@ func getOptimizedReMatchFunc(reMatch func(b []byte) bool, expr string) (func(b [
 	if err != nil {
 		logger.Panicf("BUG: unexpected error when parsing verified expr=%q: %s", expr, err)
 	}
-	if matchFunc, literalSuffix, reCost := getOptimizedReMatchFuncExt(reMatch, sre); matchFunc != nil {
+	// Prepare fast string matcher for reMatch.
+	fsm := bytesutil.NewFastStringMatcher(func(s string) bool {
+		return reMatch(bytesutil.ToUnsafeBytes(s))
+	})
+	reMatchFast := func(b []byte) bool {
+		return fsm.Match(bytesutil.ToUnsafeString(b))
+	}
+
+	if matchFunc, literalSuffix, reCost := getOptimizedReMatchFuncExt(reMatchFast, sre); matchFunc != nil {
 		// Found optimized function for matching the expr.
 		suffixUnescaped := tagCharsReverseRegexpEscaper.Replace(literalSuffix)
 		return matchFunc, suffixUnescaped, reCost
 	}
-	// Fall back to un-optimized reMatch.
-	return reMatch, "", reMatchCost
+	// Fall back to reMatchFast.
+	return reMatchFast, "", reMatchCost
 }
 
 // These cost values are used for sorting tag filters in ascending order or the required CPU time for execution.
@@ -602,7 +644,7 @@ const (
 func getOptimizedReMatchFuncExt(reMatch func(b []byte) bool, sre *syntax.Regexp) (func(b []byte) bool, string, uint64) {
 	if isDotStar(sre) {
 		// '.*'
-		return func(b []byte) bool {
+		return func(_ []byte) bool {
 			return true
 		}, "", fullMatchCost
 	}
@@ -778,91 +820,6 @@ func isLiteral(sre *syntax.Regexp) bool {
 	return sre.Op == syntax.OpLiteral && sre.Flags&syntax.FoldCase == 0
 }
 
-func getOrValues(expr string) []string {
-	sre, err := syntax.Parse(expr, syntax.Perl)
-	if err != nil {
-		logger.Panicf("BUG: unexpected error when parsing verified expr=%q: %s", expr, err)
-	}
-	orValues := getOrValuesExt(sre)
-
-	// Sort orValues for faster index seek later
-	sort.Strings(orValues)
-
-	return orValues
-}
-
-func getOrValuesExt(sre *syntax.Regexp) []string {
-	switch sre.Op {
-	case syntax.OpCapture:
-		return getOrValuesExt(sre.Sub[0])
-	case syntax.OpLiteral:
-		if !isLiteral(sre) {
-			return nil
-		}
-		return []string{string(sre.Rune)}
-	case syntax.OpEmptyMatch:
-		return []string{""}
-	case syntax.OpAlternate:
-		a := make([]string, 0, len(sre.Sub))
-		for _, reSub := range sre.Sub {
-			ca := getOrValuesExt(reSub)
-			if len(ca) == 0 {
-				return nil
-			}
-			a = append(a, ca...)
-			if len(a) > maxOrValues {
-				// It is cheaper to use regexp here.
-				return nil
-			}
-		}
-		return a
-	case syntax.OpCharClass:
-		a := make([]string, 0, len(sre.Rune)/2)
-		for i := 0; i < len(sre.Rune); i += 2 {
-			start := sre.Rune[i]
-			end := sre.Rune[i+1]
-			for start <= end {
-				a = append(a, string(start))
-				start++
-				if len(a) > maxOrValues {
-					// It is cheaper to use regexp here.
-					return nil
-				}
-			}
-		}
-		return a
-	case syntax.OpConcat:
-		if len(sre.Sub) < 1 {
-			return []string{""}
-		}
-		prefixes := getOrValuesExt(sre.Sub[0])
-		if len(prefixes) == 0 {
-			return nil
-		}
-		sre.Sub = sre.Sub[1:]
-		suffixes := getOrValuesExt(sre)
-		if len(suffixes) == 0 {
-			return nil
-		}
-		if len(prefixes)*len(suffixes) > maxOrValues {
-			// It is cheaper to use regexp here.
-			return nil
-		}
-		a := make([]string, 0, len(prefixes)*len(suffixes))
-		for _, prefix := range prefixes {
-			for _, suffix := range suffixes {
-				s := prefix + suffix
-				a = append(a, s)
-			}
-		}
-		return a
-	default:
-		return nil
-	}
-}
-
-const maxOrValues = 20
-
 var tagCharsRegexpEscaper = strings.NewReplacer(
 	"\\x00", "\\x000", // escapeChar
 	"\x00", "\\x000", // escapeChar
@@ -883,11 +840,7 @@ var tagCharsReverseRegexpEscaper = strings.NewReplacer(
 
 func getMaxRegexpCacheSize() int {
 	maxRegexpCacheSizeOnce.Do(func() {
-		n := memory.Allowed() / 1024 / 1024
-		if n < 100 {
-			n = 100
-		}
-		maxRegexpCacheSize = n
+		maxRegexpCacheSize = int(0.05 * float64(memory.Allowed()))
 	})
 	return maxRegexpCacheSize
 }
@@ -898,11 +851,7 @@ var (
 )
 
 var (
-	regexpCacheMap  = make(map[string]regexpCacheValue)
-	regexpCacheLock sync.RWMutex
-
-	regexpCacheRequests uint64
-	regexpCacheMisses   uint64
+	regexpCache = lrucache.NewCache(getMaxRegexpCacheSize)
 )
 
 type regexpCacheValue struct {
@@ -910,49 +859,43 @@ type regexpCacheValue struct {
 	reMatch       func(b []byte) bool
 	reCost        uint64
 	literalSuffix string
+	sizeBytes     int
 }
 
-func getRegexpPrefix(b []byte) ([]byte, []byte) {
-	// Fast path - search the prefix in the cache.
-	prefixesCacheLock.RLock()
-	ps, ok := prefixesCacheMap[string(b)]
-	prefixesCacheLock.RUnlock()
+// SizeBytes implements lrucache.Entry interface
+func (rcv *regexpCacheValue) SizeBytes() int {
+	return rcv.sizeBytes
+}
 
-	if ok {
+func simplifyRegexp(expr string) (string, string) {
+	// It is safe to pass the expr constructed via bytesutil.ToUnsafeString()
+	// to GetEntry() here.
+	if ps := prefixesCache.GetEntry(expr); ps != nil {
+		// Fast path - the simplified expr is found in the cache.
+		ps := ps.(*prefixSuffix)
 		return ps.prefix, ps.suffix
 	}
 
-	// Slow path - extract the regexp prefix from b.
-	prefix, suffix := extractRegexpPrefix(b)
+	// Slow path - simplify the expr.
+
+	// Make a copy of expr before using it,
+	// since it may be constructed via bytesutil.ToUnsafeString()
+	expr = string(append([]byte{}, expr...))
+	prefix, suffix := regexutil.SimplifyPromRegex(expr)
 
 	// Put the prefix and the suffix to the cache.
-	prefixesCacheLock.Lock()
-	if overflow := len(prefixesCacheMap) - getMaxPrefixesCacheSize(); overflow > 0 {
-		overflow = int(float64(len(prefixesCacheMap)) * 0.1)
-		for k := range prefixesCacheMap {
-			delete(prefixesCacheMap, k)
-			overflow--
-			if overflow <= 0 {
-				break
-			}
-		}
-	}
-	prefixesCacheMap[string(b)] = prefixSuffix{
+	ps := &prefixSuffix{
 		prefix: prefix,
 		suffix: suffix,
 	}
-	prefixesCacheLock.Unlock()
+	prefixesCache.PutEntry(expr, ps)
 
 	return prefix, suffix
 }
 
 func getMaxPrefixesCacheSize() int {
 	maxPrefixesCacheSizeOnce.Do(func() {
-		n := memory.Allowed() / 1024 / 1024
-		if n < 100 {
-			n = 100
-		}
-		maxPrefixesCacheSize = n
+		maxPrefixesCacheSize = int(0.05 * float64(memory.Allowed()))
 	})
 	return maxPrefixesCacheSize
 }
@@ -963,120 +906,40 @@ var (
 )
 
 var (
-	prefixesCacheMap  = make(map[string]prefixSuffix)
-	prefixesCacheLock sync.RWMutex
+	prefixesCache = lrucache.NewCache(getMaxPrefixesCacheSize)
 )
 
+// RegexpPrefixesCacheSize returns the number of cached regexp prefixes for tag filters.
+func RegexpPrefixesCacheSize() int {
+	return prefixesCache.Len()
+}
+
+// RegexpPrefixesCacheSizeBytes returns an approximate size in bytes for cached regexp prefixes for tag filters.
+func RegexpPrefixesCacheSizeBytes() int {
+	return prefixesCache.SizeBytes()
+}
+
+// RegexpPrefixesCacheMaxSizeBytes returns the maximum size in bytes for cached regexp prefixes for tag filters in bytes.
+func RegexpPrefixesCacheMaxSizeBytes() int {
+	return prefixesCache.SizeMaxBytes()
+}
+
+// RegexpPrefixesCacheRequests returns the number of requests to regexp prefixes cache.
+func RegexpPrefixesCacheRequests() uint64 {
+	return prefixesCache.Requests()
+}
+
+// RegexpPrefixesCacheMisses returns the number of cache misses for regexp prefixes cache.
+func RegexpPrefixesCacheMisses() uint64 {
+	return prefixesCache.Misses()
+}
+
 type prefixSuffix struct {
-	prefix []byte
-	suffix []byte
+	prefix string
+	suffix string
 }
 
-func extractRegexpPrefix(b []byte) ([]byte, []byte) {
-	sre, err := syntax.Parse(string(b), syntax.Perl)
-	if err != nil {
-		// Cannot parse the regexp. Return it all as prefix.
-		return b, nil
-	}
-	sre = simplifyRegexp(sre)
-	if sre == emptyRegexp {
-		return nil, nil
-	}
-	if isLiteral(sre) {
-		return []byte(string(sre.Rune)), nil
-	}
-	var prefix []byte
-	if sre.Op == syntax.OpConcat {
-		sub0 := sre.Sub[0]
-		if isLiteral(sub0) {
-			prefix = []byte(string(sub0.Rune))
-			sre.Sub = sre.Sub[1:]
-			if len(sre.Sub) == 0 {
-				return nil, nil
-			}
-		}
-	}
-	if _, err := syntax.Compile(sre); err != nil {
-		// Cannot compile the regexp. Return it all as prefix.
-		return b, nil
-	}
-	return prefix, []byte(sre.String())
-}
-
-func simplifyRegexp(sre *syntax.Regexp) *syntax.Regexp {
-	s := sre.String()
-	for {
-		sre = simplifyRegexpExt(sre, false, false)
-		sre = sre.Simplify()
-		if sre.Op == syntax.OpBeginText || sre.Op == syntax.OpEndText {
-			sre = emptyRegexp
-		}
-		sNew := sre.String()
-		if sNew == s {
-			return sre
-		}
-		var err error
-		sre, err = syntax.Parse(sNew, syntax.Perl)
-		if err != nil {
-			logger.Panicf("BUG: cannot parse simplified regexp %q: %s", sNew, err)
-		}
-		s = sNew
-	}
-}
-
-func simplifyRegexpExt(sre *syntax.Regexp, hasPrefix, hasSuffix bool) *syntax.Regexp {
-	switch sre.Op {
-	case syntax.OpCapture:
-		// Substitute all the capture regexps with non-capture regexps.
-		sre.Op = syntax.OpAlternate
-		sre.Sub[0] = simplifyRegexpExt(sre.Sub[0], hasPrefix, hasSuffix)
-		if sre.Sub[0] == emptyRegexp {
-			return emptyRegexp
-		}
-		return sre
-	case syntax.OpStar, syntax.OpPlus, syntax.OpQuest, syntax.OpRepeat:
-		sre.Sub[0] = simplifyRegexpExt(sre.Sub[0], hasPrefix, hasSuffix)
-		if sre.Sub[0] == emptyRegexp {
-			return emptyRegexp
-		}
-		return sre
-	case syntax.OpAlternate:
-		// Do not remove empty captures from OpAlternate, since this may break regexp.
-		for i, sub := range sre.Sub {
-			sre.Sub[i] = simplifyRegexpExt(sub, hasPrefix, hasSuffix)
-		}
-		return sre
-	case syntax.OpConcat:
-		subs := sre.Sub[:0]
-		for i, sub := range sre.Sub {
-			if sub = simplifyRegexpExt(sub, i > 0, i+1 < len(sre.Sub)); sub != emptyRegexp {
-				subs = append(subs, sub)
-			}
-		}
-		sre.Sub = subs
-		// Remove anchros from the beginning and the end of regexp, since they
-		// will be added later.
-		if !hasPrefix {
-			for len(sre.Sub) > 0 && sre.Sub[0].Op == syntax.OpBeginText {
-				sre.Sub = sre.Sub[1:]
-			}
-		}
-		if !hasSuffix {
-			for len(sre.Sub) > 0 && sre.Sub[len(sre.Sub)-1].Op == syntax.OpEndText {
-				sre.Sub = sre.Sub[:len(sre.Sub)-1]
-			}
-		}
-		if len(sre.Sub) == 0 {
-			return emptyRegexp
-		}
-		return sre
-	case syntax.OpEmptyMatch:
-		return emptyRegexp
-	default:
-		return sre
-	}
-}
-
-var emptyRegexp = &syntax.Regexp{
-	Op: syntax.OpEmptyMatch,
+// SizeBytes implements lrucache.Entry interface
+func (ps *prefixSuffix) SizeBytes() int {
+	return len(ps.prefix) + len(ps.suffix) + int(unsafe.Sizeof(*ps))
 }

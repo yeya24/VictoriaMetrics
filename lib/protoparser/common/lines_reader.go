@@ -40,7 +40,7 @@ func ReadLinesBlock(r io.Reader, dstBuf, tailBuf []byte) ([]byte, []byte, error)
 func ReadLinesBlockExt(r io.Reader, dstBuf, tailBuf []byte, maxLineLen int) ([]byte, []byte, error) {
 	startTime := time.Now()
 	if cap(dstBuf) < defaultBlockSize {
-		dstBuf = bytesutil.Resize(dstBuf, defaultBlockSize)
+		dstBuf = bytesutil.ResizeNoCopyNoOverallocate(dstBuf, defaultBlockSize)
 	}
 	dstBuf = append(dstBuf[:0], tailBuf...)
 	tailBuf = tailBuf[:0]
@@ -72,14 +72,14 @@ again:
 	// Search for the last newline in dstBuf and put the rest into tailBuf.
 	nn := bytes.LastIndexByte(dstBuf[len(dstBuf)-n:], '\n')
 	if nn < 0 {
-		// Didn't found at least a single line.
+		// Didn't find at least a single line.
 		if len(dstBuf) > maxLineLen {
 			return dstBuf, tailBuf, fmt.Errorf("too long line: more than %d bytes", maxLineLen)
 		}
 		if cap(dstBuf) < 2*len(dstBuf) {
 			// Increase dsbBuf capacity, so more data could be read into it.
 			dstBufLen := len(dstBuf)
-			dstBuf = bytesutil.Resize(dstBuf, 2*cap(dstBuf))
+			dstBuf = bytesutil.ResizeWithCopyNoOverallocate(dstBuf, 2*cap(dstBuf))
 			dstBuf = dstBuf[:dstBufLen]
 		}
 		goto again
@@ -93,7 +93,7 @@ again:
 }
 
 func isEOFLikeError(err error) bool {
-	if errors.Is(err, io.EOF) {
+	if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
 		return true
 	}
 	s := err.Error()

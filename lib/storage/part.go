@@ -1,33 +1,29 @@
 package storage
 
 import (
-	"fmt"
 	"path/filepath"
 	"sync"
-	"sync/atomic"
-	"time"
 	"unsafe"
 
-	"github.com/VictoriaMetrics/VictoriaMetrics/lib/fasttime"
+	"github.com/VictoriaMetrics/VictoriaMetrics/lib/blockcache"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/filestream"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/fs"
+	"github.com/VictoriaMetrics/VictoriaMetrics/lib/logger"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/memory"
 )
 
-func getMaxCachedIndexBlocksPerPart() int {
-	maxCachedIndexBlocksPerPartOnce.Do(func() {
-		n := memory.Allowed() / 1024 / 1024 / 8
-		if n < 16 {
-			n = 16
-		}
-		maxCachedIndexBlocksPerPart = n
+var ibCache = blockcache.NewCache(getMaxIndexBlocksCacheSize)
+
+func getMaxIndexBlocksCacheSize() int {
+	maxIndexBlockCacheSizeOnce.Do(func() {
+		maxIndexBlockCacheSize = int(0.1 * float64(memory.Allowed()))
 	})
-	return maxCachedIndexBlocksPerPart
+	return maxIndexBlockCacheSize
 }
 
 var (
-	maxCachedIndexBlocksPerPart     int
-	maxCachedIndexBlocksPerPartOnce sync.Once
+	maxIndexBlockCacheSize     int
+	maxIndexBlockCacheSizeOnce sync.Once
 )
 
 // part represents a searchable part containing time series data.
@@ -47,39 +43,29 @@ type part struct {
 	indexFile      fs.MustReadAtCloser
 
 	metaindex []metaindexRow
-
-	ibCache *indexBlockCache
 }
 
-// openFilePart opens file-based part from the given path.
-func openFilePart(path string) (*part, error) {
+// mustOpenFilePart opens file-based part from the given path.
+func mustOpenFilePart(path string) *part {
 	path = filepath.Clean(path)
 
 	var ph partHeader
-	if err := ph.ParseFromPath(path); err != nil {
-		return nil, fmt.Errorf("cannot parse path to part: %w", err)
-	}
+	ph.MustReadMetadata(path)
 
-	timestampsPath := path + "/timestamps.bin"
+	timestampsPath := filepath.Join(path, timestampsFilename)
 	timestampsFile := fs.MustOpenReaderAt(timestampsPath)
 	timestampsSize := fs.MustFileSize(timestampsPath)
 
-	valuesPath := path + "/values.bin"
+	valuesPath := filepath.Join(path, valuesFilename)
 	valuesFile := fs.MustOpenReaderAt(valuesPath)
 	valuesSize := fs.MustFileSize(valuesPath)
 
-	indexPath := path + "/index.bin"
+	indexPath := filepath.Join(path, indexFilename)
 	indexFile := fs.MustOpenReaderAt(indexPath)
 	indexSize := fs.MustFileSize(indexPath)
 
-	metaindexPath := path + "/metaindex.bin"
-	metaindexFile, err := filestream.Open(metaindexPath, true)
-	if err != nil {
-		timestampsFile.MustClose()
-		valuesFile.MustClose()
-		indexFile.MustClose()
-		return nil, fmt.Errorf("cannot open metaindex file: %w", err)
-	}
+	metaindexPath := filepath.Join(path, metaindexFilename)
+	metaindexFile := filestream.MustOpen(metaindexPath, true)
 	metaindexSize := fs.MustFileSize(metaindexPath)
 
 	size := timestampsSize + valuesSize + indexSize + metaindexSize
@@ -90,11 +76,10 @@ func openFilePart(path string) (*part, error) {
 //
 // The returned part calls MustClose on all the files passed to newPart
 // when calling part.MustClose.
-func newPart(ph *partHeader, path string, size uint64, metaindexReader filestream.ReadCloser, timestampsFile, valuesFile, indexFile fs.MustReadAtCloser) (*part, error) {
-	var errors []error
+func newPart(ph *partHeader, path string, size uint64, metaindexReader filestream.ReadCloser, timestampsFile, valuesFile, indexFile fs.MustReadAtCloser) *part {
 	metaindex, err := unmarshalMetaindexRows(nil, metaindexReader)
 	if err != nil {
-		errors = append(errors, fmt.Errorf("cannot unmarshal metaindex data: %w", err))
+		logger.Panicf("FATAL: cannot unmarshal metaindex data from %q: %s", path, err)
 	}
 	metaindexReader.MustClose()
 
@@ -105,18 +90,9 @@ func newPart(ph *partHeader, path string, size uint64, metaindexReader filestrea
 	p.timestampsFile = timestampsFile
 	p.valuesFile = valuesFile
 	p.indexFile = indexFile
-
 	p.metaindex = metaindex
-	p.ibCache = newIndexBlockCache()
 
-	if len(errors) > 0 {
-		// Return only the first error, since it has no sense in returning all errors.
-		err = fmt.Errorf("cannot initialize part %q: %w", &p, errors[0])
-		p.MustClose()
-		return nil, err
-	}
-
-	return &p, nil
+	return &p
 }
 
 // String returns human-readable representation of p.
@@ -133,8 +109,7 @@ func (p *part) MustClose() {
 	p.valuesFile.MustClose()
 	p.indexFile.MustClose()
 
-	isBig := p.size > maxSmallPartSize()
-	p.ibCache.MustClose(isBig)
+	ibCache.RemoveBlocksForPart(p)
 }
 
 type indexBlock struct {
@@ -143,140 +118,4 @@ type indexBlock struct {
 
 func (idxb *indexBlock) SizeBytes() int {
 	return cap(idxb.bhs) * int(unsafe.Sizeof(blockHeader{}))
-}
-
-type indexBlockCache struct {
-	// Put atomic counters to the top of struct in order to align them to 8 bytes on 32-bit architectures.
-	// See https://github.com/VictoriaMetrics/VictoriaMetrics/issues/212
-	requests uint64
-	misses   uint64
-
-	m  map[uint64]*indexBlockCacheEntry
-	mu sync.RWMutex
-
-	cleanerStopCh chan struct{}
-	cleanerWG     sync.WaitGroup
-}
-
-type indexBlockCacheEntry struct {
-	// Atomically updated counters must go first in the struct, so they are properly
-	// aligned to 8 bytes on 32-bit architectures.
-	// See https://github.com/VictoriaMetrics/VictoriaMetrics/issues/212
-	lastAccessTime uint64
-
-	ib *indexBlock
-}
-
-func newIndexBlockCache() *indexBlockCache {
-	var ibc indexBlockCache
-	ibc.m = make(map[uint64]*indexBlockCacheEntry)
-
-	ibc.cleanerStopCh = make(chan struct{})
-	ibc.cleanerWG.Add(1)
-	go func() {
-		defer ibc.cleanerWG.Done()
-		ibc.cleaner()
-	}()
-	return &ibc
-}
-
-func (ibc *indexBlockCache) MustClose(isBig bool) {
-	close(ibc.cleanerStopCh)
-	ibc.cleanerWG.Wait()
-	ibc.m = nil
-}
-
-// cleaner periodically cleans least recently used items.
-func (ibc *indexBlockCache) cleaner() {
-	ticker := time.NewTicker(30 * time.Second)
-	defer ticker.Stop()
-	for {
-		select {
-		case <-ticker.C:
-			ibc.cleanByTimeout()
-		case <-ibc.cleanerStopCh:
-			return
-		}
-	}
-}
-
-func (ibc *indexBlockCache) cleanByTimeout() {
-	currentTime := fasttime.UnixTimestamp()
-	ibc.mu.Lock()
-	for k, ibe := range ibc.m {
-		// Delete items accessed more than two minutes ago.
-		// This time should be enough for repeated queries.
-		if currentTime-atomic.LoadUint64(&ibe.lastAccessTime) > 2*60 {
-			delete(ibc.m, k)
-		}
-	}
-	ibc.mu.Unlock()
-}
-
-func (ibc *indexBlockCache) Get(k uint64) *indexBlock {
-	atomic.AddUint64(&ibc.requests, 1)
-
-	ibc.mu.RLock()
-	ibe := ibc.m[k]
-	ibc.mu.RUnlock()
-
-	if ibe != nil {
-		currentTime := fasttime.UnixTimestamp()
-		if atomic.LoadUint64(&ibe.lastAccessTime) != currentTime {
-			atomic.StoreUint64(&ibe.lastAccessTime, currentTime)
-		}
-		return ibe.ib
-	}
-	atomic.AddUint64(&ibc.misses, 1)
-	return nil
-}
-
-func (ibc *indexBlockCache) Put(k uint64, ib *indexBlock) {
-	ibc.mu.Lock()
-
-	// Clean superfluous cache entries.
-	if overflow := len(ibc.m) - getMaxCachedIndexBlocksPerPart(); overflow > 0 {
-		// Remove 10% of items from the cache.
-		overflow = int(float64(len(ibc.m)) * 0.1)
-		for k := range ibc.m {
-			delete(ibc.m, k)
-			overflow--
-			if overflow == 0 {
-				break
-			}
-		}
-	}
-
-	// Store frequently requested ib in the cache.
-	ibe := &indexBlockCacheEntry{
-		lastAccessTime: fasttime.UnixTimestamp(),
-		ib:             ib,
-	}
-	ibc.m[k] = ibe
-	ibc.mu.Unlock()
-}
-
-func (ibc *indexBlockCache) Requests() uint64 {
-	return atomic.LoadUint64(&ibc.requests)
-}
-
-func (ibc *indexBlockCache) Misses() uint64 {
-	return atomic.LoadUint64(&ibc.misses)
-}
-
-func (ibc *indexBlockCache) Len() uint64 {
-	ibc.mu.Lock()
-	n := uint64(len(ibc.m))
-	ibc.mu.Unlock()
-	return n
-}
-
-func (ibc *indexBlockCache) SizeBytes() uint64 {
-	n := 0
-	ibc.mu.Lock()
-	for _, e := range ibc.m {
-		n += e.ib.SizeBytes()
-	}
-	ibc.mu.Unlock()
-	return uint64(n)
 }

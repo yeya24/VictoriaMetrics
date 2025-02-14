@@ -15,7 +15,12 @@ package gozstd
 // See https://github.com/golang/go/issues/24450 .
 
 static size_t ZSTD_initDStream_usingDDict_wrapper(uintptr_t ds, uintptr_t dict) {
-    return ZSTD_initDStream_usingDDict((ZSTD_DStream*)ds, (ZSTD_DDict*)dict);
+    ZSTD_DStream *zds = (ZSTD_DStream *)ds;
+    size_t rv = ZSTD_DCtx_reset(zds, ZSTD_reset_session_only);
+    if (rv != 0) {
+        return rv;
+    }
+    return ZSTD_DCtx_refDDict(zds, (ZSTD_DDict *)dict);
 }
 
 static size_t ZSTD_freeDStream_wrapper(uintptr_t ds) {
@@ -68,13 +73,13 @@ func NewReaderDict(r io.Reader, dd *DDict) *Reader {
 	ds := C.ZSTD_createDStream()
 	initDStream(ds, dd)
 
-	inBuf := (*C.ZSTD_inBuffer)(C.malloc(C.sizeof_ZSTD_inBuffer))
-	inBuf.src = C.malloc(dstreamInBufSize)
+	inBuf := (*C.ZSTD_inBuffer)(C.calloc(1, C.sizeof_ZSTD_inBuffer))
+	inBuf.src = C.calloc(1, dstreamInBufSize)
 	inBuf.size = 0
 	inBuf.pos = 0
 
-	outBuf := (*C.ZSTD_outBuffer)(C.malloc(C.sizeof_ZSTD_outBuffer))
-	outBuf.dst = C.malloc(dstreamOutBufSize)
+	outBuf := (*C.ZSTD_outBuffer)(C.calloc(1, C.sizeof_ZSTD_outBuffer))
+	outBuf.dst = C.calloc(1, dstreamOutBufSize)
 	outBuf.size = 0
 	outBuf.pos = 0
 

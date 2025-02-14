@@ -177,13 +177,13 @@ func TestSetOps(t *testing.T) {
 	}
 	f(a, b)
 
-	rng := rand.New(rand.NewSource(0))
+	r := rand.New(rand.NewSource(1))
 	for i := 0; i < 10; i++ {
 		a = nil
 		b = nil
 		for j := 0; j < 1000; j++ {
-			a = append(a, uint64(rng.Intn(1e6)))
-			b = append(b, uint64(rng.Intn(1e6)))
+			a = append(a, uint64(r.Intn(1e6)))
+			b = append(b, uint64(r.Intn(1e6)))
 		}
 		f(a, b)
 	}
@@ -403,7 +403,7 @@ func testSetBasicOps(t *testing.T, itemsCount int) {
 
 		// Verify fast stop
 		calls := 0
-		s.ForEach(func(part []uint64) bool {
+		s.ForEach(func(_ []uint64) bool {
 			calls++
 			return false
 		})
@@ -413,7 +413,7 @@ func testSetBasicOps(t *testing.T, itemsCount int) {
 
 		// Verify ForEach on nil set.
 		var s1 *Set
-		s1.ForEach(func(part []uint64) bool {
+		s1.ForEach(func(_ []uint64) bool {
 			t.Fatalf("callback shouldn't be called on empty set")
 			return true
 		})
@@ -608,10 +608,11 @@ func TestSetSparseItems(t *testing.T) {
 }
 
 func testSetSparseItems(t *testing.T, itemsCount int) {
+	r := rand.New(rand.NewSource(1))
 	var s Set
 	m := make(map[uint64]bool)
 	for i := 0; i < itemsCount; i++ {
-		x := rand.Uint64()
+		x := r.Uint64()
 		s.Add(x)
 		m[x] = true
 	}

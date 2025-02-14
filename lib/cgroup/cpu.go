@@ -2,42 +2,60 @@ package cgroup
 
 import (
 	"fmt"
-	"io/ioutil"
 	"os"
 	"runtime"
 	"strconv"
 	"strings"
+
+	"github.com/VictoriaMetrics/metrics"
+
+	"github.com/VictoriaMetrics/VictoriaMetrics/lib/logger"
 )
 
 // AvailableCPUs returns the number of available CPU cores for the app.
+//
+// The number is rounded to the next integer value if fractional number of CPU cores are available.
 func AvailableCPUs() int {
 	return runtime.GOMAXPROCS(-1)
 }
 
 func init() {
-	updateGOMAXPROCSToCPUQuota()
+	cpuQuota := getCPUQuota()
+	if cpuQuota > 0 {
+		updateGOMAXPROCSToCPUQuota(cpuQuota)
+	}
+	cpuCoresAvailable := cpuQuota
+	if cpuCoresAvailable <= 0 {
+		cpuCoresAvailable = float64(runtime.NumCPU())
+	}
+	metrics.NewGauge(`process_cpu_cores_available`, func() float64 {
+		return cpuCoresAvailable
+	})
 }
 
-// updateGOMAXPROCSToCPUQuota updates GOMAXPROCS to cgroup CPU quota if GOMAXPROCS isn't set in environment var.
-func updateGOMAXPROCSToCPUQuota() {
+// updateGOMAXPROCSToCPUQuota updates GOMAXPROCS to cpuQuota if GOMAXPROCS isn't set in environment var.
+func updateGOMAXPROCSToCPUQuota(cpuQuota float64) {
 	if v := os.Getenv("GOMAXPROCS"); v != "" {
 		// Do not override explicitly set GOMAXPROCS.
 		return
 	}
-	q := getCPUQuota()
-	if q <= 0 {
-		// Do not change GOMAXPROCS
-		return
-	}
-	gomaxprocs := int(q + 0.5)
-	numCPU := runtime.NumCPU()
-	if gomaxprocs > numCPU {
-		// There is no sense in setting more GOMAXPROCS than the number of available CPU cores.
-		return
-	}
+
+	// Round gomaxprocs to the floor of cpuQuota, since Go runtime doesn't work well
+	// with fractional available CPU cores.
+	gomaxprocs := int(cpuQuota)
 	if gomaxprocs <= 0 {
 		gomaxprocs = 1
 	}
+	if cpuQuota > float64(gomaxprocs) {
+		logger.Warnf("rounding CPU quota %.1f to %d CPUs for performance reasons - see https://docs.victoriametrics.com/bestpractices/#kubernetes", cpuQuota, gomaxprocs)
+	}
+
+	numCPU := runtime.NumCPU()
+	if gomaxprocs > numCPU {
+		// There is no sense in setting more GOMAXPROCS than the number of available CPU cores.
+		gomaxprocs = numCPU
+	}
+
 	runtime.GOMAXPROCS(gomaxprocs)
 }
 
@@ -71,7 +89,7 @@ func getCPUStat(statName string) (int64, error) {
 
 func getOnlineCPUCount() float64 {
 	// See https://github.com/VictoriaMetrics/VictoriaMetrics/issues/685#issuecomment-674423728
-	data, err := ioutil.ReadFile("/sys/devices/system/cpu/online")
+	data, err := os.ReadFile("/sys/devices/system/cpu/online")
 	if err != nil {
 		return -1
 	}

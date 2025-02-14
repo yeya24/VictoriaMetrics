@@ -10,20 +10,20 @@ import (
 	"github.com/VictoriaMetrics/VictoriaMetrics/app/vmagent/remotewrite"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/auth"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/bytesutil"
-	"github.com/VictoriaMetrics/VictoriaMetrics/lib/cgroup"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/prompbmarshal"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/promrelabel"
 	parserCommon "github.com/VictoriaMetrics/VictoriaMetrics/lib/protoparser/common"
 	parser "github.com/VictoriaMetrics/VictoriaMetrics/lib/protoparser/influx"
+	"github.com/VictoriaMetrics/VictoriaMetrics/lib/protoparser/influx/stream"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/tenantmetrics"
-	"github.com/VictoriaMetrics/VictoriaMetrics/lib/writeconcurrencylimiter"
 	"github.com/VictoriaMetrics/metrics"
 )
 
 var (
 	measurementFieldSeparator = flag.String("influxMeasurementFieldSeparator", "_", "Separator for '{measurement}{separator}{field_name}' metric name when inserted via InfluxDB line protocol")
-	skipSingleField           = flag.Bool("influxSkipSingleField", false, "Uses '{measurement}' instead of '{measurement}{separator}{field_name}' for metic name if InfluxDB line contains only a single field")
+	skipSingleField           = flag.Bool("influxSkipSingleField", false, "Uses '{measurement}' instead of '{measurement}{separator}{field_name}' for metric name if InfluxDB line contains only a single field")
 	skipMeasurement           = flag.Bool("influxSkipMeasurement", false, "Uses '{field_name}' as a metric name while ignoring '{measurement}' and '-influxMeasurementFieldSeparator'")
+	dbLabel                   = flag.String("influxDBLabel", "db", "Default label for the DB name sent over '?db={db_name}' query parameter")
 )
 
 var (
@@ -35,11 +35,9 @@ var (
 // InsertHandlerForReader processes remote write for influx line protocol.
 //
 // See https://github.com/influxdata/telegraf/tree/master/plugins/inputs/socket_listener/
-func InsertHandlerForReader(r io.Reader, isGzipped bool) error {
-	return writeconcurrencylimiter.Do(func() error {
-		return parser.ParseStream(r, isGzipped, "", "", func(db string, rows []parser.Row) error {
-			return insertRows(nil, db, rows, nil)
-		})
+func InsertHandlerForReader(at *auth.Token, r io.Reader, isGzipped bool) error {
+	return stream.Parse(r, true, isGzipped, "", "", func(db string, rows []parser.Row) error {
+		return insertRows(at, db, rows, nil)
 	})
 }
 
@@ -51,15 +49,14 @@ func InsertHandlerForHTTP(at *auth.Token, req *http.Request) error {
 	if err != nil {
 		return err
 	}
-	return writeconcurrencylimiter.Do(func() error {
-		isGzipped := req.Header.Get("Content-Encoding") == "gzip"
-		q := req.URL.Query()
-		precision := q.Get("precision")
-		// Read db tag from https://docs.influxdata.com/influxdb/v1.7/tools/api/#write-http-endpoint
-		db := q.Get("db")
-		return parser.ParseStream(req.Body, isGzipped, precision, db, func(db string, rows []parser.Row) error {
-			return insertRows(at, db, rows, extraLabels)
-		})
+	isGzipped := req.Header.Get("Content-Encoding") == "gzip"
+	isStreamMode := req.Header.Get("Stream-Mode") == "1"
+	q := req.URL.Query()
+	precision := q.Get("precision")
+	// Read db tag from https://docs.influxdata.com/influxdb/v1.7/tools/api/#write-http-endpoint
+	db := q.Get("db")
+	return stream.Parse(req.Body, isStreamMode, isGzipped, precision, db, func(db string, rows []parser.Row) error {
+		return insertRows(at, db, rows, extraLabels)
 	})
 }
 
@@ -80,7 +77,7 @@ func insertRows(at *auth.Token, db string, rows []parser.Row, extraLabels []prom
 		hasDBKey := false
 		for j := range r.Tags {
 			tag := &r.Tags[j]
-			if tag.Key == "db" {
+			if tag.Key == *dbLabel {
 				hasDBKey = true
 			}
 			commonLabels = append(commonLabels, prompbmarshal.Label{
@@ -90,7 +87,7 @@ func insertRows(at *auth.Token, db string, rows []parser.Row, extraLabels []prom
 		}
 		if len(db) > 0 && !hasDBKey {
 			commonLabels = append(commonLabels, prompbmarshal.Label{
-				Name:  "db",
+				Name:  *dbLabel,
 				Value: db,
 			})
 		}
@@ -133,7 +130,9 @@ func insertRows(at *auth.Token, db string, rows []parser.Row, extraLabels []prom
 	ctx.ctx.Labels = labels
 	ctx.ctx.Samples = samples
 	ctx.commonLabels = commonLabels
-	remotewrite.PushWithAuthToken(at, &ctx.ctx.WriteRequest)
+	if !remotewrite.TryPush(at, &ctx.ctx.WriteRequest) {
+		return remotewrite.ErrQueueFullHTTPRetry
+	}
 	rowsInserted.Add(rowsTotal)
 	if at != nil {
 		rowsTenantInserted.Get(at).Add(rowsTotal)
@@ -161,25 +160,15 @@ func (ctx *pushCtx) reset() {
 }
 
 func getPushCtx() *pushCtx {
-	select {
-	case ctx := <-pushCtxPoolCh:
-		return ctx
-	default:
-		if v := pushCtxPool.Get(); v != nil {
-			return v.(*pushCtx)
-		}
-		return &pushCtx{}
+	if v := pushCtxPool.Get(); v != nil {
+		return v.(*pushCtx)
 	}
+	return &pushCtx{}
 }
 
 func putPushCtx(ctx *pushCtx) {
 	ctx.reset()
-	select {
-	case pushCtxPoolCh <- ctx:
-	default:
-		pushCtxPool.Put(ctx)
-	}
+	pushCtxPool.Put(ctx)
 }
 
 var pushCtxPool sync.Pool
-var pushCtxPoolCh = make(chan *pushCtx, cgroup.AvailableCPUs())
